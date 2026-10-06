@@ -2,6 +2,8 @@
 
 Run a dedicated named tunnel with an Access email policy. The existing local URL remains available, and the selector container remains bound to loopback on the host.
 
+The configured phone bookmark for this installation is **https://next.pixelwood.co/#finished**. Sign in using the email allowed in Cloudflare; the one-time code arrives by email. Dedicated tunnel files live in `C:\cloudflared\automaticbookselector.yml` and `C:\cloudflared\automaticbookselector.json`; the existing `config.yml` and other Windows tunnel services are separate.
+
 ## Configuration
 
 1. In Cloudflare Zero Trust, add a **Self-hosted** Access application for your chosen hostname. Use an Allow policy containing only the intended email address(es); enable one-time PIN or your existing identity provider. Record your team URL and application audience (AUD).
