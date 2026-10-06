@@ -35,6 +35,10 @@ async function refreshState(initial = false) {
   const email = state.email;
   $('#email-status').textContent = !email.configured ? 'Email delivery isn’t configured yet. Add your provider settings to .env and restart. Reminders stay off.' : `${email.mode === 'off' ? 'Reminders are off.' : 'Reminders enabled.'} Delivery to ${email.recipient}.${email.last_sent ? ' Last sent: ' + new Date(email.last_sent).toLocaleString() + '.' : ''}${email.error ? ' ' + email.error : ''}${email.uncertain_batches ? ' Some delivery outcomes are uncertain; those books will not be emailed again automatically.' : ''}`;
   $('#test-email').disabled = !email.configured || Boolean($('#test-email').dataset.busy);
+  const ai = state.ai;
+  $('#ai-usage').textContent = `AI allowance: $${ai.spent_usd.toFixed(3)} of $${ai.limit_usd.toFixed(2)} USD used or reserved this month.${ai.error ? ' ' + ai.error : ''}`;
+  $('#ai-refresh').disabled = !ai.configured || ai.busy || Boolean($('#ai-refresh').dataset.busy);
+  if (!ai.configured) $('#ai-picks-status').textContent = 'Add OPENAI_API_KEY to your private .env and restart to enable AI picks.';
   renderQuestions();
   const signature = JSON.stringify(state.libraries);
   if (signature !== librarySignature) {
@@ -57,11 +61,13 @@ async function loadPicks() {
   const ticket = ++loadingPicks;
   const result = await api('/api/recommendations?library=' + encodeURIComponent($('#library').value) + '&search=' + encodeURIComponent($('#search').value));
   if (ticket !== loadingPicks) return;
+  if (state?.ai.configured) $('#ai-picks-status').textContent = `${result.source === 'ai' ? 'Saved AI picks · ' + new Date(result.generated_at).toLocaleString() + '. ' : ''}${result.ai_note || ''}`;
   currentBooks = result.books; $('#eligible').textContent = result.eligible ? `${result.eligible.toLocaleString()} unread works · showing ${result.books.length}` : '';
   $('#book-grid').replaceChildren();
   if (!result.books.length) $('#book-grid').append(el('div', 'empty', state?.sync.running ? 'Your catalogue is syncing. First picks will appear shortly.' : 'No matches yet. Try another search, loosen your length preference, or sync your library.'));
   result.books.forEach((book, index) => {
     const article = el('article', 'book'), top = el('div', 'book-top'), symbol = el('div', 'book-symbol', String(index + 1).padStart(2, '0'));
+    const image = coverImage(book); symbol.replaceChildren(image);
     symbol.setAttribute('aria-hidden', 'true'); const heading = el('div'); heading.append(el('h3', '', book.title), el('p', 'book-author', book.author || 'Unknown author'));
     const check = el('label', 'check'), checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.checked = selection.has(book.id); checkbox.setAttribute('aria-label', `Select ${book.title}`);
     checkbox.addEventListener('change', () => {checkbox.checked ? selection.add(book.id) : selection.delete(book.id); updateCount();}); check.append(checkbox); top.append(symbol, heading, check);
@@ -75,6 +81,7 @@ async function loadPicks() {
     actions.append(note, hide); if (book.queued) actions.append(el('span', '', 'Added to ABS')); content.append(actions); article.append(top, content); $('#book-grid').append(article);
   }); updateCount();
 }
+function coverImage(book) { const image = el('img', 'book-cover'); image.src = '/api/cover?id=' + encodeURIComponent(book.id); image.alt = ''; image.loading = 'lazy'; image.decoding = 'async'; image.width = 140; image.height = 180; image.addEventListener('error', () => {const placeholder = el('span', 'cover-placeholder', 'Cover unavailable'); image.replaceWith(placeholder);}, {once: true}); return image; }
 function renderQuestions() {
   $('#questions').replaceChildren();
   if (!state.questions.length) $('#questions').append(el('div', 'empty', 'All caught up. When ABS marks a book finished, you can tell your shelf what worked for you here.'));
@@ -82,7 +89,7 @@ function renderQuestions() {
     const card = el('article', 'question'), info = el('div'); info.append(el('h3', '', book.title), el('p', '', `${book.author}${book.recommended ? ' · One of your selected recommendations' : ' · Finished in ABS'}`));
     const actions = el('div', 'question-buttons'), feedback = el('button', '', 'How did it feel?'), skip = el('button', 'secondary', 'Skip');
     feedback.addEventListener('click', () => openFeedback(book)); skip.addEventListener('click', () => action(skip, async () => {await api('/api/questions/dismiss', {book_id: book.id}); await refreshState();}));
-    actions.append(feedback, skip); card.append(info, actions); $('#questions').append(card);
+    actions.append(feedback, skip); const cover = el('div', 'question-cover'); cover.append(coverImage(book)); card.append(cover, info, actions); $('#questions').append(card);
   }
 }
 function openFeedback(book) { const form = $('#feedback-form'); form.reset(); form.elements.book_id.value = book.id; form.elements.scope.value = state.kick.active ? 'current' : 'lasting'; if (book.feedback) { for (const k of ['rating', 'scope', 'notes', 'enjoyed', 'avoid']) form.elements[k].value = book.feedback[k] ?? ''; form.elements.dnf.checked = Boolean(book.feedback.dnf); } $('#feedback-title').textContent = book.title; if (!$('#feedback-dialog').open) $('#feedback-dialog').showModal(); }
@@ -90,6 +97,7 @@ $('#close-dialog').addEventListener('click', () => $('#feedback-dialog').close()
 $('#feedback-form').addEventListener('submit', event => { event.preventDefault(); const f = event.currentTarget; action(f.querySelector('[type=submit]'), async () => { await api('/api/feedback', {book_id: f.elements.book_id.value, rating: f.elements.rating.value ? Number(f.elements.rating.value) : null, scope: f.elements.scope.value, notes: f.elements.notes.value, enjoyed: f.elements.enjoyed.value, avoid: f.elements.avoid.value, dnf: f.elements.dnf.checked}); $('#feedback-dialog').close(); showPanel('finished'); await refreshState(); await loadPicks(); message('Feedback saved with your chosen taste context.'); }); });
 $('#profile-form').addEventListener('submit', event => {event.preventDefault(); const f = event.currentTarget; const data = {}; for (const k of ['likes', 'avoids', 'preferred_authors', 'author_preference']) data[k] = f.elements[k].value; data.max_hours = Number(f.elements.max_hours.value); data.weights = {}; for (const k of Object.keys(state.dimensions)) data.weights[k] = Number(f.elements[k].value); action(f.querySelector('[type=submit]'), async () => { await api('/api/profile', data); await loadPicks(); message('Your taste is saved. Discovery has a fresh set of picks.'); });});
 $('#sync').addEventListener('click', () => action($('#sync'), async () => {await api('/api/sync', {}); message('Sync started. Progress and catalogue changes will appear shortly.');}));
+$('#ai-refresh').addEventListener('click', () => action($('#ai-refresh'), async () => { message('Reading your taste and choosing a fresh set…'); const result = await api('/api/ai/generate', {library_id: $('#library').value}); $('#search').value = ''; await refreshState(); await loadPicks(); message(`${result.generated} AI recommendations saved. They’ll stay here until you refresh again.`); }));
 $('#refresh').addEventListener('click', () => action($('#refresh'), async () => {await refreshPlaylists(); await loadPicks();}));
 $('#library').addEventListener('change', async () => {selection.clear(); updateCount(); try {await refreshPlaylists(); await loadPicks();} catch (error) {message(error.message, true);}});
 let searchTimer; $('#search').addEventListener('input', () => {clearTimeout(searchTimer); searchTimer = setTimeout(() => loadPicks().catch(e => message(e.message, true)), 300);});
@@ -100,7 +108,7 @@ function fillExtras() { for (const k of ['text', 'avoids', 'duration_days']) $('
 $('#kick-form').addEventListener('submit', event => {event.preventDefault(); const f = event.currentTarget; action(f.querySelector('[type=submit]'), async () => {await api('/api/kick', {text: f.elements.text.value, avoids: f.elements.avoids.value, duration_days: Number(f.elements.duration_days.value)}); await refreshState(); await loadPicks(); message('Your current kick is saved. Your lasting taste is unchanged.');});});
 $('#clear-kick').addEventListener('click', () => action($('#clear-kick'), async () => {await api('/api/kick', {text: '', avoids: '', duration_days: 21}); await refreshState(); fillExtras(); await loadPicks(); message('Kick cleared. Your lasting taste guides the next picks.');}));
 $('#email-form').addEventListener('submit', event => {event.preventDefault(); const f = event.currentTarget; action(f.querySelector('[type=submit]'), async () => {await api('/api/email/settings', {mode: f.elements.mode.value, timezone: f.elements.timezone.value, quiet_start: Number(f.elements.quiet_start.value), quiet_end: Number(f.elements.quiet_end.value)}); await refreshState(); message('Email preferences saved.');});});
-$('#test-email').addEventListener('click', () => action($('#test-email'), async () => {await api('/api/email/test', {}); message('Test email sent. Check your inbox.');}));
+$('#test-email').addEventListener('click', () => action($('#test-email'), async () => {await api('/api/email/test', {}); message('Your email provider accepted the test. Check your inbox or Spam for delivery.');}));
 async function followFeedbackLink() { if (!location.hash.startsWith('#feedback=')) return; const id = decodeURIComponent(location.hash.slice(10)); const book = await api('/api/book?id=' + encodeURIComponent(id)); document.querySelectorAll('.panel').forEach(p => p.hidden = p.id !== 'finished'); $('#email-form').hidden = true; document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.panel === 'finished')); openFeedback(book); }
 window.addEventListener('hashchange', () => followFeedbackLink().catch(e => message(e.message, true)));
 refreshState(true).then(followFeedbackLink).catch(e => message(e.message, true));

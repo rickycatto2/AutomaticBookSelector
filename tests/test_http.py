@@ -70,10 +70,16 @@ class HTTPTests(unittest.TestCase):
         policy = AccessPolicy(self.port, 'https://selector.example.com', 'https://reader.cloudflareaccess.com', 'audience', 'reader@example.com')
         policy.verify = lambda token: token == 'valid-test-token'
         self.server.RequestHandlerClass = handler(self.store, self.port, policy)
-        for path in ('/', '/api/state', '/api/recommendations'):
+        for path in ('/', '/api/state', '/api/recommendations', '/api/cover?id=one'):
             self.assertEqual(self.request(path, headers={'Host': 'selector.example.com'})[0], 403)
             self.assertEqual(self.request(path, headers={'Host': 'selector.example.com', 'Cf-Access-Jwt-Assertion': 'invalid'})[0], 403)
-            self.assertEqual(self.request(path, headers={'Host': 'selector.example.com', 'Cf-Access-Jwt-Assertion': 'valid-test-token'})[0], 200)
+            self.assertEqual(self.request(path, headers={'Host': 'selector.example.com', 'Cf-Access-Jwt-Assertion': 'valid-test-token'})[0], 404 if path.startswith('/api/cover') else 200)
+
+    def test_paid_refresh_requires_authentication_and_matching_origin(self):
+        payload = {'library_id': 'lib'}
+        self.assertEqual(self.request('/api/ai/generate', payload)[0], 403)
+        self.assertEqual(self.request('/api/ai/generate', payload,
+            {'X-Selector-Request': '1', 'Origin': 'https://attacker.example'})[0], 403)
 
     def test_remote_feedback_requires_authentication_and_matching_origin(self):
         policy = AccessPolicy(self.port, 'https://selector.example.com', 'https://reader.cloudflareaccess.com', 'audience', 'reader@example.com')

@@ -3,6 +3,8 @@
 !core.py
 !access.py
 !notifications.py
+!ai.py
+!covers.py
 !requirements.txt
 !static/
 !static/**

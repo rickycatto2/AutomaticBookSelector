@@ -29,13 +29,15 @@ Use `docker compose down` to stop; persistent data remains. `docker compose down
 - Reads all accessible book libraries (or just `ABS_LIBRARY_IDS`) with pagination. Requires audio files and excludes missing or invalid items. Keeps exact ABS item IDs for playlist additions.
 - Reads the authenticated user's completion/progress every 15 minutes by default, independent of whether the browser is open. Refresh interval can be set with `SYNC_INTERVAL_SECONDS` (minimum 60 seconds).
 - Excludes Goodreads-read works, ABS-finished works, in-progress items, rated/DNF works and explicitly hidden items from discovery. Matches by ISBN or normalized title **and** author; does not fuzzy-match titles alone. Shows one audiobook edition per work.
-- Learns from explicit local ratings, theme feedback, highly rated Goodreads authors, matched rated-book descriptions, and your editable profile. Completion never creates a positive rating. Goodreads reviews are stored for future refinement but are not automatically interpreted as positive text.
+- Learns from explicit local ratings, theme feedback, highly rated Goodreads authors, matched rated-book descriptions, and your editable profile. Completion never creates a positive rating. The local engine stores Goodreads reviews without treating all their words as positive preferences; optional AI interprets selected reviews in context.
 - Offers post-completion questions, including a marker for books previously selected in the app. Skipped questions remain dismissed.
 - Adds a temporary **Current kick**, with one-, three-, or six-week expiry or manual clearing. Its keyword boost stays separate from lasting taste. Feedback can apply generally, only to the active kick, or simply remain a note.
 - Supports optional SMTP completion emails or weekly roundups, quiet hours, duplicate suppression, and signed-in links directly to a book's feedback form. Email starts off. See [EMAIL.md](EMAIL.md) for Brevo setup and delivery behavior.
 - Adds selections through ABS's playlist batch endpoint, checks the library and playlist owner, and skips books already present. It does not replace existing playlist contents or write back listening progress.
 
-The recommendation engine uses local weighted keyword similarity, catalogue descriptions, explicit theme weights, and author affinity. Explanations report those actual signals; they are not invented AI summaries. This first version requires no AI API key or paid service. Sparse/inaccurate ABS metadata limits recommendation quality. Author gender is not inferred: the preference is saved as context, and the preferred-author list is applied directly. General free-text notes are stored; the separate “worked for you” and “less of” fields drive theme learning.
+The local recommendation engine uses weighted keyword similarity, theme weights and author affinity. Optional OpenAI recommendations interpret your reviews and current mood, then choose from an expanded shortlist of unread ABS books. Press **Refresh recommendations** to generate a saved set; reopening the page never makes a paid call. This app enforces a maximum $5 USD monthly AI allowance and keeps local picks available. See [AI.md](AI.md) for configuration, data sharing, caching and spending details.
+
+Cover images come from ABS through the authenticated app. The browser never sees the ABS token, and covers are not sent to OpenAI. Missing covers show a placeholder.
 
 ## Local development
 

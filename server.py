@@ -11,13 +11,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from core import ABS, AppError, Store, load_env
 from access import AccessPolicy
 from notifications import Notifications
+from ai import AI
+from covers import Covers
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
 
-def handler(store, port, access_policy=None, notifications=None):
+def handler(store, port, access_policy=None, notifications=None, ai=None, covers=None):
     access_policy = access_policy or AccessPolicy.from_env(port)
     notifications = notifications or Notifications(store)
+    ai = ai or AI(store)
+    covers = covers or Covers(store)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             # No request payloads, credentials, server URL or upstream response body.
@@ -48,11 +52,17 @@ def handler(store, port, access_policy=None, notifications=None):
                 if parsed.path == '/api/health':
                     self.respond(200, {'ok': True})
                 elif parsed.path == '/api/state':
-                    self.respond(200, store.snapshot() | {'email': notifications.settings()})
+                    self.respond(200, store.snapshot() | {'email': notifications.settings(), 'ai': ai.status()})
                 elif parsed.path == '/api/book':
                     self.respond(200, store.feedback_book(params.get('id', [''])[0]))
                 elif parsed.path == '/api/recommendations':
-                    self.respond(200, store.recommendations(params.get('library', [''])[0], params.get('search', [''])[0]))
+                    self.respond(200, ai.recommendations(params.get('library', [''])[0], params.get('search', [''])[0]))
+                elif parsed.path == '/api/cover':
+                    cover = covers.get(params.get('id', [''])[0])
+                    if cover:
+                        self.respond(200, cover[0], cover[1])
+                    else:
+                        self.respond(404, {'error': 'No cover available.'})
                 elif parsed.path == '/api/playlists':
                     self.respond(200, {'playlists': store.playlists(params.get('library', [''])[0])})
                 elif parsed.path in ('/', '/app.js', '/style.css'):
@@ -96,6 +106,11 @@ def handler(store, port, access_policy=None, notifications=None):
                         result = store.profile(payload)
                     elif self.path == '/api/kick':
                         result = store.kick(payload)
+                    elif self.path == '/api/ai/generate':
+                        library = payload.get('library_id', '')
+                        if not isinstance(library, str) or len(library) > 128:
+                            raise AppError('Choose a valid library.')
+                        result = ai.generate(library)
                     elif self.path == '/api/email/settings':
                         result = notifications.settings(payload)
                     elif self.path == '/api/email/test':
