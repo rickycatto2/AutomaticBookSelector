@@ -24,6 +24,18 @@ def encoded(value):
 def digest(value):
     return hashlib.sha256(encoded(value)).hexdigest()
 
+def grounded_pick(book, pick):
+    # LGBTQ+ genre tags alone do not identify the central romantic pairing.
+    # Apply this to saved sets too, without another paid request.
+    claims = re.sub(r'\b(?:not|not specifically|less specifically)\s+(?:sapphic|lesbian)\b', '', pick['reason'], flags=re.I)
+    description = normalize(book['description'])
+    evidence = re.search(r'\b(?:sapphic|lesbian|wlw|two women|another woman|other women|female female)\b', description)
+    if re.search(r'\b(?:sapphic|lesbian)\b', claims, re.I) and not evidence:
+        return pick | {'fit': 'exploratory',
+            'reason': 'An exploratory pick with an uncertain fit. The catalogue description does not establish a sapphic central romance.',
+            'cautions': ['A queer genre tag does not necessarily mean a sapphic central romance.'] + pick['cautions'][:1]}
+    return pick
+
 def object_schema(properties):
     return {'type': 'object', 'properties': properties, 'required': list(properties), 'additionalProperties': False}
 
@@ -183,6 +195,7 @@ class AI:
             return local
         result = json.loads(cached['result'])
         books = {b['id']: b for b in rows}
+        result['picks'] = [grounded_pick(books[p['id']], p) for p in result['picks'] if p['id'] in books]
         labels = {'lasting': 'A lasting taste match', 'current': 'For your current kick',
                   'nonfiction': 'A non-fiction possibility', 'exploratory': 'An exploratory pick'}
         stale = cached['fingerprint'] != fingerprint
@@ -249,6 +262,9 @@ class AI:
                 'Give each a specific, short explanation (maximum 65 words) grounded in its supplied description and taste; '
                 'do not claim the user liked a book unless the taste record says so. Do not invent plots, author identity/gender, '
                 'narrator performance or availability. Flag thin metadata or mismatches in up to two cautions. '
+                'An LGBTQ+ genre does NOT establish a sapphic central romance. Only call a romance sapphic or lesbian when '
+                'the supplied description clearly establishes the central pairing as women loving women. '
+                'If the pairing is unspecified, say so; if the blurb describes a man and a woman, never call it sapphic. '
                 'Include one or two relevant non-fiction possibilities when the supplied candidates support them; never force them. '
                 'Aim for author variety. Label each fit lasting/current/exploratory/nonfiction. '
                 'Summary: maximum 100 words explaining this set. Avoid spoilers. Output only the requested structure.',
@@ -265,6 +281,8 @@ class AI:
                     or any(not isinstance(c, str) or len(c) > 400 for c in p['cautions'])
                     or (p['fit'] == 'current' and not context['kick']['active'])):
                     raise AppError('The AI returned an unsupported book or explanation. Local picks are still available.')
+            candidate_books = {b['id']: b for b in candidates}
+            result['picks'] = [grounded_pick(candidate_books[p['id']], p) for p in picks]
             if self.fingerprint(library)[0] != fingerprint:
                 raise AppError('Your shelf or taste changed while preparing picks. Generate again when your changes are finished.')
             with self.store.db() as db:

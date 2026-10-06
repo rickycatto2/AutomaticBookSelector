@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ai import AI, AppError, Rejected, LIMIT
+from ai import AI, AppError, Rejected, LIMIT, grounded_pick
 from core import Store
 from covers import Covers
 from test_core import FakeABS, export
@@ -133,6 +133,21 @@ class AITests(unittest.TestCase):
             self.assertNotIn('tools', request)
             self.assertNotIn('fake-token', json.dumps(request))
             self.assertLessEqual(request['max_output_tokens'], 3500)
+
+    def test_queer_genre_alone_does_not_support_sapphic_claim(self):
+        book = {'description': 'Jesse and Lulu reunite in a friendship study.', 'genres': ['LGBTQ+', 'Romance']}
+        pick = {'id': 'one', 'reason': 'A warm sapphic romance.', 'fit': 'current', 'cautions': []}
+        checked = grounded_pick(book, pick)
+        self.assertEqual(checked['fit'], 'exploratory')
+        self.assertIn('does not establish', checked['reason'])
+        self.assertEqual(checked['id'], 'one')
+        self.assertEqual(pick['fit'], 'current')
+
+    def test_explicit_description_supports_claim_and_negative_claim_is_preserved(self):
+        pick = {'id': 'one', 'reason': 'A warm sapphic romance.', 'fit': 'current', 'cautions': []}
+        self.assertEqual(grounded_pick({'description': 'A cozy sapphic romance.'}, pick), pick)
+        negative = pick | {'reason': 'Not sapphic, but a possible romance alternative.'}
+        self.assertEqual(grounded_pick({'description': 'A romance about Jesse and Lulu.'}, negative), negative)
 
     def test_covers_reject_unknown_ids_path_traversal_and_html(self):
         covers = Covers(self.store)
