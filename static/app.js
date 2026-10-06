@@ -8,7 +8,7 @@ async function api(path, data, raw = false) {
   return result;
 }
 function message(text, error = false) { $('#message').hidden = false; $('#message').textContent = text; $('#message').className = error ? 'error' : ''; }
-async function action(button, fn) { button.disabled = true; try { await fn(); } catch (error) { message(error.message, true); } finally { button.disabled = false; } }
+async function action(button, fn) { button.disabled = true; button.dataset.busy = '1'; try { await fn(); } catch (error) { message(error.message, true); } finally { delete button.dataset.busy; button.disabled = button.id === 'test-email' ? !state?.email.configured : false; } }
 function updateCount() { $('#selected-count').textContent = selection.size; $('#queue').disabled = selection.size === 0; }
 function showPanel(name) { history.replaceState(null, '', '#' + name); $('#email-form').hidden = name !== 'settings'; document.querySelectorAll('.panel').forEach(p => p.hidden = p.id !== name); document.querySelectorAll('.tabs button').forEach(b => {b.classList.toggle('active', b.dataset.panel === name); b.setAttribute('aria-pressed', String(b.dataset.panel === name));}); }
 document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => showPanel(b.dataset.panel)));
@@ -34,7 +34,7 @@ async function refreshState(initial = false) {
   $('#kick-status').textContent = !state.kick.text ? 'No current kick. Your lasting taste guides discovery.' : state.kick.active ? state.kick.expires_at ? 'Active until ' + new Date(state.kick.expires_at).toLocaleDateString() + '. Save again to renew.' : 'Active until you clear it.' : 'This kick has expired. Renew it, change it, or let it rest.';
   const email = state.email;
   $('#email-status').textContent = !email.configured ? 'Email delivery isn’t configured yet. Add your provider settings to .env and restart. Reminders stay off.' : `${email.mode === 'off' ? 'Reminders are off.' : 'Reminders enabled.'} Delivery to ${email.recipient}.${email.last_sent ? ' Last sent: ' + new Date(email.last_sent).toLocaleString() + '.' : ''}${email.error ? ' ' + email.error : ''}${email.uncertain_batches ? ' Some delivery outcomes are uncertain; those books will not be emailed again automatically.' : ''}`;
-  $('#test-email').disabled = !email.configured;
+  $('#test-email').disabled = !email.configured || Boolean($('#test-email').dataset.busy);
   renderQuestions();
   const signature = JSON.stringify(state.libraries);
   if (signature !== librarySignature) {
