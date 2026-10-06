@@ -66,6 +66,21 @@ class MoodEmailTests(unittest.TestCase):
             expired = {b['id']: b['score'] for b in self.store.recommendations()['books']}
         self.assertGreater(active['two'], expired['two'])
         self.assertEqual(self.store.feedback_book('one')['feedback']['scope'], 'current')
+    def test_review_correction_preserves_original_kick_after_mood_changes(self):
+        with patch('core.now', return_value=BASE.isoformat()):
+            self.store.kick({'text': 'cozy', 'duration_days': 7})
+            self.store.feedback({'book_id': 'one', 'rating': 4, 'notes': 'Original note', 'scope': 'current', 'dnf': True})
+        original = self.store.feedback_book('one')['feedback']
+        with patch('core.now', return_value=(BASE + datetime.timedelta(days=8)).isoformat()):
+            self.store.kick({'text': 'thrillers', 'duration_days': 7})
+            self.store.feedback(original | {'dnf': False})
+        edited = self.store.feedback_book('one')['feedback']
+        self.assertEqual(edited['kick_context'], original['kick_context'])
+        self.assertEqual(edited['dnf'], 0)
+        self.assertEqual(edited['notes'], original['notes'])
+        self.store.feedback(edited | {'scope': 'lasting'})
+        self.assertEqual(self.store.feedback_book('one')['feedback']['kick_context'], '')
+
     def test_invalid_kick_scope_and_email_settings_are_rejected(self):
         with self.assertRaises(AppError): self.store.kick({'text': 'x', 'duration_days': -1})
         with self.assertRaises(AppError): self.store.feedback({'book_id': 'one', 'scope': 'bad'})

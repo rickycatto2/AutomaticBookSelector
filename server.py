@@ -55,6 +55,8 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
                     self.respond(200, store.snapshot() | {'email': notifications.settings(), 'ai': ai.status()})
                 elif parsed.path == '/api/book':
                     self.respond(200, store.feedback_book(params.get('id', [''])[0]))
+                elif parsed.path == '/api/reviews':
+                    self.respond(200, store.reviews(params.get('search', [''])[0]))
                 elif parsed.path == '/api/recommendations':
                     self.respond(200, ai.recommendations(params.get('library', [''])[0], params.get('search', [''])[0]))
                 elif parsed.path == '/api/cover':

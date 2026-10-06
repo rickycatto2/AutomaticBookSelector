@@ -63,6 +63,27 @@ class HTTPTests(unittest.TestCase):
         for path in ('/.env', '/core.py', '/data/selector.sqlite3', '/../.env'):
             self.assertEqual(self.request(path)[0], 404)
 
+    def test_saved_review_can_be_found_and_dnf_corrected_without_losing_notes(self):
+        original = {'book_id': 'one', 'rating': 4, 'scope': 'none', 'notes': 'My note',
+                    'enjoyed': 'Voice', 'avoid': 'Slow ending', 'dnf': True}
+        self.store.feedback(original)
+        self.store.feedback({'book_id': 'two', 'dismissed': True})
+        status, _, body = self.request('/api/reviews?search=ONE')
+        self.assertEqual(status, 200)
+        saved = json.loads(body)['books']
+        self.assertEqual([b['id'] for b in saved], ['one'])
+        self.assertEqual(saved[0]['feedback']['dnf'], 1)
+        status, _, body = self.request('/api/book?id=one')
+        correction = json.loads(body)['feedback'] | {'dnf': False}
+        self.assertEqual(self.request('/api/feedback', correction, {'X-Selector-Request': '1'})[0], 200)
+        corrected = self.store.feedback_book('one')['feedback']
+        self.assertEqual(corrected['dnf'], 0)
+        for key in ('rating', 'notes', 'enjoyed', 'avoid', 'scope'):
+            self.assertEqual(corrected[key], original[key])
+        self.assertEqual([b['id'] for b in self.store.reviews()['books']], ['one'])
+        self.assertEqual(self.request('/api/reviews?search=%25')[0], 200)
+        self.assertEqual(self.store.reviews('%')['books'], [])
+
     def test_invalid_json_rejected(self):
         self.assertEqual(self.request('/api/profile', [], {'X-Selector-Request': '1'})[0], 400)
 
@@ -70,7 +91,7 @@ class HTTPTests(unittest.TestCase):
         policy = AccessPolicy(self.port, 'https://selector.example.com', 'https://reader.cloudflareaccess.com', 'audience', 'reader@example.com')
         policy.verify = lambda token: token == 'valid-test-token'
         self.server.RequestHandlerClass = handler(self.store, self.port, policy)
-        for path in ('/', '/api/state', '/api/recommendations', '/api/cover?id=one'):
+        for path in ('/', '/api/state', '/api/reviews', '/api/recommendations', '/api/cover?id=one'):
             self.assertEqual(self.request(path, headers={'Host': 'selector.example.com'})[0], 403)
             self.assertEqual(self.request(path, headers={'Host': 'selector.example.com', 'Cf-Access-Jwt-Assertion': 'invalid'})[0], 403)
             self.assertEqual(self.request(path, headers={'Host': 'selector.example.com', 'Cf-Access-Jwt-Assertion': 'valid-test-token'})[0], 404 if path.startswith('/api/cover') else 200)

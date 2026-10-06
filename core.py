@@ -398,6 +398,22 @@ class Store:
             feedback = db.execute('SELECT * FROM feedback WHERE book_id=?', (book_id,)).fetchone()
             return dict(row) | {'feedback': dict(feedback) if feedback else None}
 
+    def reviews(self, search=''):
+        if not isinstance(search, str) or len(search) > 500:
+            raise AppError('Search by a title or author shorter than 500 characters.')
+        with self.db() as db:
+            rows = db.execute('''SELECT b.id,b.title,b.author,f.* FROM feedback f
+              JOIN books b ON b.id=f.book_id
+              WHERE (f.dismissed=0 OR f.rating IS NOT NULL OR f.dnf=1 OR
+                f.notes<>'' OR f.enjoyed<>'' OR f.avoid<>'')
+              AND instr(lower(b.title || ' ' || b.author),lower(?))>0
+              ORDER BY f.updated_at DESC,b.id LIMIT 101''', (search.strip(),)).fetchall()
+            fields = ('book_id', 'rating', 'notes', 'enjoyed', 'avoid', 'dnf',
+                      'dismissed', 'updated_at', 'scope', 'kick_context')
+            return {'books': [{k: row[k] for k in ('id', 'title', 'author')} |
+                    {'feedback': {k: row[k] for k in fields}} for row in rows[:100]],
+                    'more': len(rows) > 100}
+
     def feedback(self, payload):
         book_id = payload.get('book_id')
         rating = payload.get('rating')
@@ -411,7 +427,10 @@ class Store:
         with self.lock, self.db() as db:
             if not db.execute('SELECT id FROM books WHERE id=?', (book_id,)).fetchone():
                 raise AppError('Book was not found in your synced library.')
-            context = self.kick()['started_at'] if scope == 'current' and self.kick()['active'] else ''
+            previous = db.execute('SELECT scope,kick_context FROM feedback WHERE book_id=?', (book_id,)).fetchone()
+            kick = self.kick()
+            # Correcting a review must not move its mood-specific feedback into a later kick.
+            context = previous['kick_context'] if scope == 'current' and previous and previous['scope'] == 'current' else kick['started_at'] if scope == 'current' and kick['active'] else ''
             db.execute('''INSERT INTO feedback
               (book_id,rating,notes,enjoyed,avoid,dnf,dismissed,updated_at,scope,kick_context)
               VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(book_id) DO UPDATE SET
