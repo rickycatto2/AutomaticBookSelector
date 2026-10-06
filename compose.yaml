@@ -1,0 +1,20 @@
+services:
+  selector:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      GOODREADS_IMPORT_DIR: /imports
+      HOST: 0.0.0.0
+      PORT: 5077
+    ports:
+      - "127.0.0.1:5077:5077"
+    volumes:
+      - selector-data:/data
+      # CSV is read-only. Token and source are not mounted into this directory.
+      - ./imports:/imports:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+volumes:
+  selector-data:

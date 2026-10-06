@@ -1,0 +1,70 @@
+import json
+import pathlib
+import tempfile
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+
+from core import Store
+from server import handler
+from test_core import FakeABS
+
+
+class HTTPTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = Store(pathlib.Path(self.temp.name) / 'http.sqlite3', FakeABS())
+        self.store.sync()
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), handler(self.store, 0))
+        self.port = self.server.server_port
+        self.server.RequestHandlerClass = handler(self.store, self.port)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.temp.cleanup()
+
+    def request(self, path, payload=None, headers=None):
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(f'http://127.0.0.1:{self.port}' + path, data=data, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, error.headers, error.read()
+
+    def test_page_and_state_do_not_expose_credentials(self):
+        status, headers, body = self.request('/')
+        self.assertEqual(status, 200)
+        self.assertIn(b'Your next good listen', body)
+        self.assertIn("frame-ancestors 'none'", headers['Content-Security-Policy'])
+        status, _, body = self.request('/api/state')
+        self.assertEqual(status, 200)
+        self.assertNotIn(b'fake-token', body)
+
+    def test_host_validation_blocks_dns_rebinding(self):
+        status, _, _ = self.request('/api/state', headers={'Host': 'attacker.example'})
+        self.assertEqual(status, 403)
+
+    def test_write_requires_custom_header_and_local_origin(self):
+        payload = {'book_id': 'one', 'rating': 5}
+        self.assertEqual(self.request('/api/feedback', payload)[0], 403)
+        self.assertEqual(self.request('/api/feedback', payload, {'X-Selector-Request': '1', 'Origin': 'https://attacker.example'})[0], 403)
+        self.assertEqual(self.request('/api/feedback', payload, {'X-Selector-Request': '1', 'Origin': f'http://127.0.0.1:{self.port}'})[0], 200)
+
+    def test_sensitive_files_and_traversal_are_not_served(self):
+        for path in ('/.env', '/core.py', '/data/selector.sqlite3', '/../.env'):
+            self.assertEqual(self.request(path)[0], 404)
+
+    def test_invalid_json_rejected(self):
+        self.assertEqual(self.request('/api/profile', [], {'X-Selector-Request': '1'})[0], 400)
+
+
+if __name__ == '__main__':
+    unittest.main()

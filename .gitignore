@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+*.csv
+*.sqlite*
+*.db*
+data/
+imports/
+__pycache__/
+.venv/
+work/
+*.log
