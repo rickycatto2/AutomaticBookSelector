@@ -10,7 +10,7 @@ async function api(path, data, raw = false) {
 function message(text, error = false) { $('#message').hidden = false; $('#message').textContent = text; $('#message').className = error ? 'error' : ''; }
 async function action(button, fn) { button.disabled = true; try { await fn(); } catch (error) { message(error.message, true); } finally { button.disabled = false; } }
 function updateCount() { $('#selected-count').textContent = selection.size; $('#queue').disabled = selection.size === 0; }
-function showPanel(name) { document.querySelectorAll('.panel').forEach(p => p.hidden = p.id !== name); document.querySelectorAll('.tabs button').forEach(b => {b.classList.toggle('active', b.dataset.panel === name); b.setAttribute('aria-pressed', String(b.dataset.panel === name));}); }
+function showPanel(name) { history.replaceState(null, '', '#' + name); document.querySelectorAll('.panel').forEach(p => p.hidden = p.id !== name); document.querySelectorAll('.tabs button').forEach(b => {b.classList.toggle('active', b.dataset.panel === name); b.setAttribute('aria-pressed', String(b.dataset.panel === name));}); }
 document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => showPanel(b.dataset.panel)));
 function fillProfile() {
   const form = $('#profile-form'); for (const key of ['likes', 'avoids', 'preferred_authors', 'author_preference', 'max_hours']) form.elements[key].value = state.profile[key];
@@ -91,6 +91,7 @@ $('#library').addEventListener('change', async () => {selection.clear(); updateC
 let searchTimer; $('#search').addEventListener('input', () => {clearTimeout(searchTimer); searchTimer = setTimeout(() => loadPicks().catch(e => message(e.message, true)), 300);});
 $('#queue').addEventListener('click', () => action($('#queue'), async () => {const result = await api('/api/queue', {book_ids: [...selection], library_id: $('#library').value, playlist_id: $('#playlist').value}); selection.clear(); updateCount(); await refreshPlaylists(); await loadPicks(); message(`${result.added} books added to ${result.name}. ${result.already_present ? result.already_present + ' were already there. ' : ''}Bookramp can now pull this ABS playlist.`);}));
 $('#import').addEventListener('click', () => action($('#import'), async () => {const file = $('#csv-file').files[0]; if (!file) throw new Error('Choose your Goodreads CSV first.'); const result = await api('/api/import', await file.arrayBuffer(), true); await refreshState(); await loadPicks(); message(result.skipped ? result.reason : `${result.imported} Goodreads entries imported.`);}));
+const initialPanel = location.hash.slice(1); if (['discover', 'profile', 'finished', 'settings'].includes(initialPanel)) showPanel(initialPanel);
 refreshState(true).catch(e => message(e.message, true));
 setInterval(() => refreshState().catch(e => message(e.message, true)), 5000);
 updateCount();

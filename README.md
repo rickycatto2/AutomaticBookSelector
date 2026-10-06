@@ -37,9 +37,10 @@ The recommendation engine uses local weighted keyword similarity, catalogue desc
 
 ## Local development
 
-Python 3.14, with no third-party runtime packages:
+Python 3.14. The Cloudflare JWT verifier uses PyJWT and its cryptography dependency:
 
 ```powershell
+python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 python server.py
 ```
@@ -50,7 +51,9 @@ Native Python uses `./data/selector.sqlite3` by default and reads a root CSV. Do
 
 `.env`, CSVs, databases, imports and runtime files are Git-ignored. The Docker build context uses an explicit allowlist of source files and never includes `.env` or reading data. Runtime credentials are read only on the server and sent to ABS as an Authorization header, never a URL query parameter. Upstream bodies and tokens are not logged or returned to the browser. HTTP redirects are rejected to avoid forwarding a token to another host; fix `ABS_URL` to the final address instead. TLS certificate verification stays enabled.
 
-Compose publishes only to `127.0.0.1:5077`. Host validation, same-origin checks and a custom request header protect local write actions. This is a single-user local tool, not an internet-facing service with authentication. Use a separate data directory/volume for each ABS account; the app refuses to sync a different user into an existing database.
+Compose publishes only to `127.0.0.1:5077`. Host validation, same-origin checks and a custom request header protect local write actions. Local access is a single-user interface. Use a separate data directory/volume for each ABS account; the app refuses to sync a different user into an existing database.
+
+Optional private phone access is described in [TUNNEL.md](TUNNEL.md). A public hostname requires Cloudflare Access authentication and signed-token verification at both the tunnel and app. Bookmark `/#finished` to open completion feedback directly.
 
 Back up the Docker volume after stopping the service:
 

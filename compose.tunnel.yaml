@@ -1,0 +1,12 @@
+services:
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    depends_on:
+      selector:
+        condition: service_healthy
+    volumes:
+      - ./.cloudflare/config.yml:/etc/cloudflared/config.yml:ro
+      - ./.cloudflare/tunnel.json:/etc/cloudflared/tunnel.json:ro
+    # No public/local ports or ABS/OpenAI credentials are passed to this service.

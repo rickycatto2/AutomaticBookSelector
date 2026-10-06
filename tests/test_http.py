@@ -8,6 +8,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 from core import Store
+from access import AccessPolicy
 from server import handler
 from test_core import FakeABS
 
@@ -64,6 +65,24 @@ class HTTPTests(unittest.TestCase):
 
     def test_invalid_json_rejected(self):
         self.assertEqual(self.request('/api/profile', [], {'X-Selector-Request': '1'})[0], 400)
+
+    def test_public_api_and_page_require_valid_access_identity(self):
+        policy = AccessPolicy(self.port, 'https://selector.example.com', 'https://reader.cloudflareaccess.com', 'audience', 'reader@example.com')
+        policy.verify = lambda token: token == 'valid-test-token'
+        self.server.RequestHandlerClass = handler(self.store, self.port, policy)
+        for path in ('/', '/api/state', '/api/recommendations'):
+            self.assertEqual(self.request(path, headers={'Host': 'selector.example.com'})[0], 403)
+            self.assertEqual(self.request(path, headers={'Host': 'selector.example.com', 'Cf-Access-Jwt-Assertion': 'invalid'})[0], 403)
+            self.assertEqual(self.request(path, headers={'Host': 'selector.example.com', 'Cf-Access-Jwt-Assertion': 'valid-test-token'})[0], 200)
+
+    def test_remote_feedback_requires_authentication_and_matching_origin(self):
+        policy = AccessPolicy(self.port, 'https://selector.example.com', 'https://reader.cloudflareaccess.com', 'audience', 'reader@example.com')
+        policy.verify = lambda token: token == 'valid-test-token'
+        self.server.RequestHandlerClass = handler(self.store, self.port, policy)
+        headers = {'Host': 'selector.example.com', 'Cf-Access-Jwt-Assertion': 'valid-test-token', 'X-Selector-Request': '1'}
+        self.assertEqual(self.request('/api/feedback', {'book_id': 'one', 'rating': 5}, headers)[0], 403)
+        headers['Origin'] = 'https://selector.example.com'
+        self.assertEqual(self.request('/api/feedback', {'book_id': 'one', 'rating': 5}, headers)[0], 200)
 
 
 if __name__ == '__main__':

@@ -9,11 +9,13 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from core import ABS, AppError, Store, load_env
+from access import AccessPolicy
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
 
-def handler(store, port):
+def handler(store, port, access_policy=None):
+    access_policy = access_policy or AccessPolicy.from_env(port)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             # No request payloads, credentials, server URL or upstream response body.
@@ -31,12 +33,12 @@ def handler(store, port):
             self.end_headers()
             self.wfile.write(data)
 
-        def valid_host(self):
-            return self.headers.get('Host', '') in {f'localhost:{port}', f'127.0.0.1:{port}'}
+        def authorized(self):
+            return access_policy.authorize(self.headers)
 
         def do_GET(self):
-            if not self.valid_host():
-                self.respond(403, {'error': 'Use the local app address.'})
+            if not self.authorized():
+                self.respond(403, {'error': 'Sign in through Cloudflare Access, or use the local app address.'})
                 return
             parsed = urllib.parse.urlsplit(self.path)
             params = urllib.parse.parse_qs(parsed.query)
@@ -61,11 +63,10 @@ def handler(store, port):
                 self.respond(500, {'error': 'The app could not complete this request.'})
 
         def do_POST(self):
-            if not self.valid_host() or self.headers.get('X-Selector-Request') != '1':
-                self.respond(403, {'error': 'Open the app locally to make changes.'})
+            if not self.authorized() or self.headers.get('X-Selector-Request') != '1':
+                self.respond(403, {'error': 'Sign in to the app before making changes.'})
                 return
-            origin = self.headers.get('Origin')
-            if origin and origin not in {f'http://localhost:{port}', f'http://127.0.0.1:{port}'}:
+            if not access_policy.valid_origin(self.headers):
                 self.respond(403, {'error': 'Cross-origin requests are not allowed.'})
                 return
             try:

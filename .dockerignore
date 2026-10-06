@@ -1,6 +1,8 @@
 *
 !server.py
 !core.py
+!access.py
+!requirements.txt
 !static/
 !static/**
 !Dockerfile

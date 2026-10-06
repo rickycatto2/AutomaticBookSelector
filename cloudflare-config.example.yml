@@ -1,0 +1,13 @@
+# Copy to .cloudflare/config.yml and fill in values after creating an Access app.
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: /etc/cloudflared/tunnel.json
+ingress:
+  - hostname: selector.yourdomain.com
+    service: http://selector:5077
+    originRequest:
+      access:
+        required: true
+        teamName: YOUR_TEAM_NAME
+        audTag:
+          - YOUR_ACCESS_APPLICATION_AUDIENCE
+  - service: http_status:404
