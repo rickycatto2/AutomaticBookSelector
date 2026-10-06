@@ -3,7 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 IN_DOCKER=1 DATA_DIR=/data HOST
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY core.py server.py access.py ./
+COPY core.py server.py access.py notifications.py ./
 COPY static ./static
 RUN useradd --uid 10001 --create-home reader && mkdir /data /imports && chown reader:reader /data /imports
 USER reader

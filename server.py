@@ -10,12 +10,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from core import ABS, AppError, Store, load_env
 from access import AccessPolicy
+from notifications import Notifications
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
 
-def handler(store, port, access_policy=None):
+def handler(store, port, access_policy=None, notifications=None):
     access_policy = access_policy or AccessPolicy.from_env(port)
+    notifications = notifications or Notifications(store)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             # No request payloads, credentials, server URL or upstream response body.
@@ -46,7 +48,9 @@ def handler(store, port, access_policy=None):
                 if parsed.path == '/api/health':
                     self.respond(200, {'ok': True})
                 elif parsed.path == '/api/state':
-                    self.respond(200, store.snapshot())
+                    self.respond(200, store.snapshot() | {'email': notifications.settings()})
+                elif parsed.path == '/api/book':
+                    self.respond(200, store.feedback_book(params.get('id', [''])[0]))
                 elif parsed.path == '/api/recommendations':
                     self.respond(200, store.recommendations(params.get('library', [''])[0], params.get('search', [''])[0]))
                 elif parsed.path == '/api/playlists':
@@ -90,6 +94,12 @@ def handler(store, port, access_policy=None):
                             result = {'started': True}
                     elif self.path == '/api/profile':
                         result = store.profile(payload)
+                    elif self.path == '/api/kick':
+                        result = store.kick(payload)
+                    elif self.path == '/api/email/settings':
+                        result = notifications.settings(payload)
+                    elif self.path == '/api/email/test':
+                        result = notifications.test()
                     elif self.path == '/api/feedback':
                         result = store.feedback(payload)
                     elif self.path == '/api/questions/dismiss':
@@ -136,8 +146,17 @@ def main():
             quiet_sync(store)
             threading.Event().wait(interval)
     threading.Thread(target=poll, daemon=True).start()
+    notifications = Notifications(store)
+    def email_poll():
+        while True:
+            try:
+                notifications.process()
+            except Exception:
+                print('Email reminders need attention. Check the app settings.', flush=True)
+            threading.Event().wait(60)
+    threading.Thread(target=email_poll, daemon=True).start()
     port = int(os.getenv('PORT', '5077'))
-    server = ThreadingHTTPServer((os.getenv('HOST', '127.0.0.1'), port), handler(store, port))
+    server = ThreadingHTTPServer((os.getenv('HOST', '127.0.0.1'), port), handler(store, port, notifications=notifications))
     server.daemon_threads = True
     print(f'AutomaticBookSelector: http://localhost:{port}', flush=True)
     try:

@@ -10,7 +10,7 @@ async function api(path, data, raw = false) {
 function message(text, error = false) { $('#message').hidden = false; $('#message').textContent = text; $('#message').className = error ? 'error' : ''; }
 async function action(button, fn) { button.disabled = true; try { await fn(); } catch (error) { message(error.message, true); } finally { button.disabled = false; } }
 function updateCount() { $('#selected-count').textContent = selection.size; $('#queue').disabled = selection.size === 0; }
-function showPanel(name) { history.replaceState(null, '', '#' + name); document.querySelectorAll('.panel').forEach(p => p.hidden = p.id !== name); document.querySelectorAll('.tabs button').forEach(b => {b.classList.toggle('active', b.dataset.panel === name); b.setAttribute('aria-pressed', String(b.dataset.panel === name));}); }
+function showPanel(name) { history.replaceState(null, '', '#' + name); $('#email-form').hidden = name !== 'settings'; document.querySelectorAll('.panel').forEach(p => p.hidden = p.id !== name); document.querySelectorAll('.tabs button').forEach(b => {b.classList.toggle('active', b.dataset.panel === name); b.setAttribute('aria-pressed', String(b.dataset.panel === name));}); }
 document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => showPanel(b.dataset.panel)));
 function fillProfile() {
   const form = $('#profile-form'); for (const key of ['likes', 'avoids', 'preferred_authors', 'author_preference', 'max_hours']) form.elements[key].value = state.profile[key];
@@ -30,7 +30,11 @@ async function refreshState(initial = false) {
   $('#import-status').textContent = state.goodreads_import ? `${state.goodreads_import.rows.toLocaleString()} entries seeded on ${new Date(state.goodreads_import.at).toLocaleDateString()}.` : 'No Goodreads seed yet. Add your export below.';
   $('#connection-status').textContent = state.username ? `Connected to ABS as ${state.username}. ${state.stats.in_progress} books in progress.` : state.configured ? 'Credentials configured. Waiting for first successful sync.' : 'Add ABS_URL and ABS_TOKEN to .env, then restart the app.';
   $('#question-count').textContent = state.questions.length;
-  if (initial) fillProfile();
+  if (initial) { fillProfile(); fillExtras(); }
+  $('#kick-status').textContent = !state.kick.text ? 'No current kick. Your lasting taste guides discovery.' : state.kick.active ? state.kick.expires_at ? 'Active until ' + new Date(state.kick.expires_at).toLocaleDateString() + '. Save again to renew.' : 'Active until you clear it.' : 'This kick has expired. Renew it, change it, or let it rest.';
+  const email = state.email;
+  $('#email-status').textContent = !email.configured ? 'Email delivery isn’t configured yet. Add your provider settings to .env and restart. Reminders stay off.' : `${email.mode === 'off' ? 'Reminders are off.' : 'Reminders enabled.'} Delivery to ${email.recipient}.${email.last_sent ? ' Last sent: ' + new Date(email.last_sent).toLocaleString() + '.' : ''}${email.error ? ' ' + email.error : ''}${email.uncertain_batches ? ' Some delivery outcomes are uncertain; those books will not be emailed again automatically.' : ''}`;
+  $('#test-email').disabled = !email.configured;
   renderQuestions();
   const signature = JSON.stringify(state.libraries);
   if (signature !== librarySignature) {
@@ -62,7 +66,7 @@ async function loadPicks() {
     const check = el('label', 'check'), checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.checked = selection.has(book.id); checkbox.setAttribute('aria-label', `Select ${book.title}`);
     checkbox.addEventListener('change', () => {checkbox.checked ? selection.add(book.id) : selection.delete(book.id); updateCount();}); check.append(checkbox); top.append(symbol, heading, check);
     const content = el('div', 'book-content'), meta = el('div', 'book-meta'); if (book.duration) meta.append(el('span', 'chip', `${(book.duration / 3600).toFixed(1)} hours`));
-    book.genres.slice(0, 2).forEach(g => meta.append(el('span', 'chip', g))); content.append(meta, el('p', 'reason-label', 'WHY IT MAY BE YOUR KIND OF BOOK'));
+    book.genres.slice(0, 2).forEach(g => meta.append(el('span', 'chip', g))); if (book.fit_label) meta.append(el('span', 'chip', book.fit_label)); content.append(meta, el('p', 'reason-label', 'WHY IT MAY BE YOUR KIND OF BOOK'));
     const reasons = el('ul', 'reasons'); book.reasons.forEach(r => reasons.append(el('li', '', r))); content.append(reasons);
     const details = el('details'); details.append(el('summary', '', 'Read the blurb & listening notes'), el('p', 'blurb', book.description || 'No description available.'));
     if (book.narrator) details.append(el('p', 'blurb', 'Narrated by ' + book.narrator)); book.cautions.forEach(c => details.append(el('p', 'blurb', c))); content.append(details);
@@ -81,9 +85,9 @@ function renderQuestions() {
     actions.append(feedback, skip); card.append(info, actions); $('#questions').append(card);
   }
 }
-function openFeedback(book) { const form = $('#feedback-form'); form.reset(); form.elements.book_id.value = book.id; $('#feedback-title').textContent = book.title; $('#feedback-dialog').showModal(); }
+function openFeedback(book) { const form = $('#feedback-form'); form.reset(); form.elements.book_id.value = book.id; form.elements.scope.value = state.kick.active ? 'current' : 'lasting'; if (book.feedback) { for (const k of ['rating', 'scope', 'notes', 'enjoyed', 'avoid']) form.elements[k].value = book.feedback[k] ?? ''; form.elements.dnf.checked = Boolean(book.feedback.dnf); } $('#feedback-title').textContent = book.title; if (!$('#feedback-dialog').open) $('#feedback-dialog').showModal(); }
 $('#close-dialog').addEventListener('click', () => $('#feedback-dialog').close());
-$('#feedback-form').addEventListener('submit', event => { event.preventDefault(); const f = event.currentTarget; action(f.querySelector('[type=submit]'), async () => { await api('/api/feedback', {book_id: f.elements.book_id.value, rating: f.elements.rating.value ? Number(f.elements.rating.value) : null, notes: f.elements.notes.value, enjoyed: f.elements.enjoyed.value, avoid: f.elements.avoid.value, dnf: f.elements.dnf.checked}); $('#feedback-dialog').close(); await refreshState(); await loadPicks(); message('Feedback saved. Your next picks now use what you told us.'); }); });
+$('#feedback-form').addEventListener('submit', event => { event.preventDefault(); const f = event.currentTarget; action(f.querySelector('[type=submit]'), async () => { await api('/api/feedback', {book_id: f.elements.book_id.value, rating: f.elements.rating.value ? Number(f.elements.rating.value) : null, scope: f.elements.scope.value, notes: f.elements.notes.value, enjoyed: f.elements.enjoyed.value, avoid: f.elements.avoid.value, dnf: f.elements.dnf.checked}); $('#feedback-dialog').close(); showPanel('finished'); await refreshState(); await loadPicks(); message('Feedback saved with your chosen taste context.'); }); });
 $('#profile-form').addEventListener('submit', event => {event.preventDefault(); const f = event.currentTarget; const data = {}; for (const k of ['likes', 'avoids', 'preferred_authors', 'author_preference']) data[k] = f.elements[k].value; data.max_hours = Number(f.elements.max_hours.value); data.weights = {}; for (const k of Object.keys(state.dimensions)) data.weights[k] = Number(f.elements[k].value); action(f.querySelector('[type=submit]'), async () => { await api('/api/profile', data); await loadPicks(); message('Your taste is saved. Discovery has a fresh set of picks.'); });});
 $('#sync').addEventListener('click', () => action($('#sync'), async () => {await api('/api/sync', {}); message('Sync started. Progress and catalogue changes will appear shortly.');}));
 $('#refresh').addEventListener('click', () => action($('#refresh'), async () => {await refreshPlaylists(); await loadPicks();}));
@@ -92,6 +96,13 @@ let searchTimer; $('#search').addEventListener('input', () => {clearTimeout(sear
 $('#queue').addEventListener('click', () => action($('#queue'), async () => {const result = await api('/api/queue', {book_ids: [...selection], library_id: $('#library').value, playlist_id: $('#playlist').value}); selection.clear(); updateCount(); await refreshPlaylists(); await loadPicks(); message(`${result.added} books added to ${result.name}. ${result.already_present ? result.already_present + ' were already there. ' : ''}Bookramp can now pull this ABS playlist.`);}));
 $('#import').addEventListener('click', () => action($('#import'), async () => {const file = $('#csv-file').files[0]; if (!file) throw new Error('Choose your Goodreads CSV first.'); const result = await api('/api/import', await file.arrayBuffer(), true); await refreshState(); await loadPicks(); message(result.skipped ? result.reason : `${result.imported} Goodreads entries imported.`);}));
 const initialPanel = location.hash.slice(1); if (['discover', 'profile', 'finished', 'settings'].includes(initialPanel)) showPanel(initialPanel);
-refreshState(true).catch(e => message(e.message, true));
+function fillExtras() { for (const k of ['text', 'avoids', 'duration_days']) $('#kick-form').elements[k].value = state.kick[k]; for (const k of ['mode', 'timezone', 'quiet_start', 'quiet_end']) $('#email-form').elements[k].value = state.email[k]; }
+$('#kick-form').addEventListener('submit', event => {event.preventDefault(); const f = event.currentTarget; action(f.querySelector('[type=submit]'), async () => {await api('/api/kick', {text: f.elements.text.value, avoids: f.elements.avoids.value, duration_days: Number(f.elements.duration_days.value)}); await refreshState(); await loadPicks(); message('Your current kick is saved. Your lasting taste is unchanged.');});});
+$('#clear-kick').addEventListener('click', () => action($('#clear-kick'), async () => {await api('/api/kick', {text: '', avoids: '', duration_days: 21}); await refreshState(); fillExtras(); await loadPicks(); message('Kick cleared. Your lasting taste guides the next picks.');}));
+$('#email-form').addEventListener('submit', event => {event.preventDefault(); const f = event.currentTarget; action(f.querySelector('[type=submit]'), async () => {await api('/api/email/settings', {mode: f.elements.mode.value, timezone: f.elements.timezone.value, quiet_start: Number(f.elements.quiet_start.value), quiet_end: Number(f.elements.quiet_end.value)}); await refreshState(); message('Email preferences saved.');});});
+$('#test-email').addEventListener('click', () => action($('#test-email'), async () => {await api('/api/email/test', {}); message('Test email sent. Check your inbox.');}));
+async function followFeedbackLink() { if (!location.hash.startsWith('#feedback=')) return; const id = decodeURIComponent(location.hash.slice(10)); const book = await api('/api/book?id=' + encodeURIComponent(id)); document.querySelectorAll('.panel').forEach(p => p.hidden = p.id !== 'finished'); $('#email-form').hidden = true; document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.panel === 'finished')); openFeedback(book); }
+window.addEventListener('hashchange', () => followFeedbackLink().catch(e => message(e.message, true)));
+refreshState(true).then(followFeedbackLink).catch(e => message(e.message, true));
 setInterval(() => refreshState().catch(e => message(e.message, true)), 5000);
 updateCount();

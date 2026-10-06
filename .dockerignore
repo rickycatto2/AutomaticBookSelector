@@ -2,6 +2,7 @@
 !server.py
 !core.py
 !access.py
+!notifications.py
 !requirements.txt
 !static/
 !static/**

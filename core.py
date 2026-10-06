@@ -92,6 +92,13 @@ DEFAULT_PROFILE = {
     'weights': {'voice': 3, 'intimacy': 3, 'reinvention': 3, 'humor': 3, 'strangeness': 2, 'literary': 3},
 }
 
+def kick_terms(value):
+    terms = tokens(value)
+    for group in ({'cosy', 'cozy'}, {'sapphic', 'lesbian', 'wlw'}, {'thriller', 'thrillers'}, {'romance', 'romantic'}):
+        if terms & group:
+            terms |= group
+    return terms
+
 
 class AppError(Exception):
     pass
@@ -187,6 +194,21 @@ class Store:
             ''')
             if not self.meta(db, 'profile'):
                 self.set_meta(db, 'profile', DEFAULT_PROFILE)
+            columns = {r[1] for r in db.execute('PRAGMA table_info(feedback)')}
+            if 'scope' not in columns:
+                db.execute("ALTER TABLE feedback ADD COLUMN scope TEXT NOT NULL DEFAULT 'lasting'")
+            if 'kick_context' not in columns:
+                db.execute("ALTER TABLE feedback ADD COLUMN kick_context TEXT NOT NULL DEFAULT ''")
+            if 'created_at' not in {r[1] for r in db.execute('PRAGMA table_info(completion_questions)')}:
+                db.execute("ALTER TABLE completion_questions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+                db.execute('UPDATE completion_questions SET created_at=?', (now(),))
+            db.executescript('''CREATE TABLE IF NOT EXISTS email_receipts (
+                book_id TEXT PRIMARY KEY, batch_id TEXT, status TEXT, attempted_at TEXT);
+                CREATE TABLE IF NOT EXISTS email_batches (
+                id TEXT PRIMARY KEY, status TEXT, created_at TEXT, completed_at TEXT);''')
+            # A crash during SMTP delivery has an unknown outcome. Never resend it automatically.
+            db.execute("UPDATE email_receipts SET status='uncertain' WHERE status='sending'")
+            db.execute("UPDATE email_batches SET status='uncertain' WHERE status='sending'")
 
     @contextlib.contextmanager
     def db(self):
@@ -320,8 +342,8 @@ class Store:
                     db.execute('UPDATE books SET progress=?, finished=?, finished_at=? WHERE id=?',
                                (max(0, min(1, float(entry.get('progress') or 0))), int(finished), str(entry.get('finishedAt') or ''), entry['libraryItemId']))
                     if finished:
-                        db.execute('INSERT OR IGNORE INTO completion_questions(book_id,finished_at) VALUES (?,?)',
-                                   (entry['libraryItemId'], str(entry.get('finishedAt') or '')))
+                        db.execute('INSERT OR IGNORE INTO completion_questions(book_id,finished_at,created_at) VALUES (?,?,?)',
+                                   (entry['libraryItemId'], str(entry.get('finishedAt') or ''), now()))
                 self.set_meta(db, 'libraries', [{'id': l['id'], 'name': l['name']} for l in libs])
                 self.set_meta(db, 'abs_user_id', user_id)
                 self.set_meta(db, 'abs_username', me.get('username', ''))
@@ -353,6 +375,29 @@ class Store:
                 self.changed()
             return self.meta(db, 'profile')
 
+    def kick(self, payload=None):
+        with self.lock, self.db() as db:
+            if payload is not None:
+                text, avoids = payload.get('text', ''), payload.get('avoids', '')
+                days = payload.get('duration_days', 21)
+                if not isinstance(text, str) or not isinstance(avoids, str) or max(len(text), len(avoids)) > 2000 or type(days) is not int or days not in (0, 7, 21, 42):
+                    raise AppError('Choose a valid kick duration and text shorter than 2,000 characters.')
+                started = now()
+                expires = (datetime.datetime.fromisoformat(started) + datetime.timedelta(days=days)).isoformat() if days else None
+                self.set_meta(db, 'kick', {'text': text.strip(), 'avoids': avoids.strip(), 'duration_days': days,
+                                         'started_at': started, 'expires_at': expires})
+                self.changed()
+            result = self.meta(db, 'kick', {'text': '', 'avoids': '', 'duration_days': 21, 'expires_at': None, 'started_at': ''})
+            return result | {'active': bool(result['text']) and (not result['expires_at'] or result['expires_at'] > now())}
+
+    def feedback_book(self, book_id):
+        with self.db() as db:
+            row = db.execute('SELECT id,title,author FROM books WHERE id=?', (book_id,)).fetchone()
+            if not row:
+                raise AppError('This book is not in your synced library.')
+            feedback = db.execute('SELECT * FROM feedback WHERE book_id=?', (book_id,)).fetchone()
+            return dict(row) | {'feedback': dict(feedback) if feedback else None}
+
     def feedback(self, payload):
         book_id = payload.get('book_id')
         rating = payload.get('rating')
@@ -360,14 +405,21 @@ class Store:
             raise AppError('Rating must be 1 to 5, or left blank.')
         if any(not isinstance(payload.get(k, ''), str) or len(payload.get(k, '')) > 5000 for k in ('notes', 'enjoyed', 'avoid')):
             raise AppError('Feedback text is too long or invalid.')
+        scope = payload.get('scope', 'lasting')
+        if scope not in ('lasting', 'current', 'none'):
+            raise AppError('Choose whether this feedback reflects your lasting taste or current mood.')
         with self.lock, self.db() as db:
             if not db.execute('SELECT id FROM books WHERE id=?', (book_id,)).fetchone():
                 raise AppError('Book was not found in your synced library.')
-            db.execute('''INSERT INTO feedback VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(book_id) DO UPDATE SET
+            context = self.kick()['started_at'] if scope == 'current' and self.kick()['active'] else ''
+            db.execute('''INSERT INTO feedback
+              (book_id,rating,notes,enjoyed,avoid,dnf,dismissed,updated_at,scope,kick_context)
+              VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(book_id) DO UPDATE SET
               rating=excluded.rating,notes=excluded.notes,enjoyed=excluded.enjoyed,avoid=excluded.avoid,
-              dnf=excluded.dnf,dismissed=excluded.dismissed,updated_at=excluded.updated_at''',
+              dnf=excluded.dnf,dismissed=excluded.dismissed,updated_at=excluded.updated_at,
+              scope=excluded.scope,kick_context=excluded.kick_context''',
                        (book_id, rating, payload.get('notes', ''), payload.get('enjoyed', ''), payload.get('avoid', ''),
-                        int(bool(payload.get('dnf'))), int(bool(payload.get('dismissed'))), now()))
+                        int(bool(payload.get('dnf'))), int(bool(payload.get('dismissed'))), now(), scope, context))
             db.execute('UPDATE completion_questions SET dismissed=1 WHERE book_id=?', (book_id,))
             self.changed()
         return {'saved': True}
@@ -394,10 +446,15 @@ class Store:
             return {'stats': stats, 'sync': dict(self.sync_state), 'last_sync': self.meta(db, 'last_sync'),
                     'goodreads_import': self.meta(db, 'goodreads_import'), 'libraries': self.meta(db, 'libraries', []),
                     'username': self.meta(db, 'abs_username'), 'questions': questions, 'profile': self.meta(db, 'profile'),
-                    'dimensions': {k: v[0] for k, v in DIMENSIONS.items()}, 'configured': bool(self.abs.url and self.abs.token)}
+                    'dimensions': {k: v[0] for k, v in DIMENSIONS.items()}, 'configured': bool(self.abs.url and self.abs.token),
+                    'kick': self.kick()}
 
     def recommendations(self, library_id='', search='', limit=36):
         with self.lock:
+            active = self.kick()['active']
+            if getattr(self, '_cache_kick_active', None) != active:
+                self.cache = None
+            self._cache_kick_active = active
             if self.cache is None:
                 self.cache = self._rank()
             rows = [r for r in self.cache if (not library_id or r['library_id'] == library_id) and
@@ -405,6 +462,7 @@ class Store:
             return {'books': rows[:limit], 'eligible': len(rows)}
 
     def _rank(self):
+        kick = self.kick()
         with self.db() as db:
             books = [dict(r) for r in db.execute('SELECT * FROM books WHERE available=1')]
             history = [dict(r) for r in db.execute('SELECT * FROM history')]
@@ -444,6 +502,9 @@ class Store:
             h = by_isbn.get(b['isbn']) if b['isbn'] else None
             h = h or by_key.get(key)
             f = feedback.get(b['id'], {})
+            if f.get('scope') == 'none' or (f.get('scope') == 'current' and
+                    (not kick['active'] or f.get('kick_context') != kick['started_at'])):
+                f = {}
             rating = f.get('rating') if f.get('rating') is not None else (h or {}).get('rating')
             if rating and key not in trained:
                 target = positive if rating > 3 else negative
@@ -483,6 +544,14 @@ class Store:
             score = 100 * sum(positives.get(t, 0) * idf[t] for t in terms) / (pos_norm * norm)
             score -= 70 * sum(negatives.get(t, 0) * idf[t] for t in terms) / (neg_norm * norm)
             reasons, cautions = [], []
+            kick_match = terms & kick_terms(kick['text']) if kick['active'] else set()
+            if kick_match:
+                score += min(65, 22 * len(kick_match))
+                reasons.append('For your current kick: catalogue mentions ' + ', '.join(sorted(kick_match)[:3]))
+            kick_avoid = terms & kick_terms(kick['avoids']) if kick['active'] else set()
+            if kick_avoid:
+                score -= min(70, 25 * len(kick_avoid))
+                cautions.append('Less welcome in your current mood: ' + ', '.join(sorted(kick_avoid)[:3]))
             if b['author_key'] in pref_authors:
                 score += 22
                 reasons.append('By an author you explicitly want to read more of')
@@ -519,6 +588,7 @@ class Store:
             results.append({k: b[k] for k in ('id', 'library_id', 'title', 'author', 'description', 'duration', 'narrator')} |
                            {'genres': json.loads(b['genres']), 'score': round(score, 1), 'reasons': reasons[:3], 'cautions': cautions,
                             'queued': b['id'] in queued})
+            results[-1]['fit_label'] = 'For your current kick' if kick_match else 'A lasting taste match' if reasons[0].startswith(('By an author', 'You rated', 'Matches themes')) or score > 15 else 'An exploratory pick'
         results.sort(key=lambda b: (-b['score'], b['title'], b['id']))
         # Prefer one edition per work in discovery while keeping exact ABS IDs.
         seen, unique = set(), []
