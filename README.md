@@ -40,6 +40,12 @@ The local recommendation engine uses weighted keyword similarity, theme weights 
 
 Cover images come from ABS through the authenticated app. The browser never sees the ABS token, and covers are not sent to OpenAI. Missing covers show a placeholder.
 
+## Goodreads exports and listening stats
+
+**Goodreads export** lets you review completed books, correct primary authors/ISBNs, set a separate public star rating, and download only new titles. Every row includes its actual completion date as **Date Read**. Saved export batches can be downloaded again, and pasted import failures return to the review queue. Private ratings and reviews never enter these CSVs. See [GOODREADS-EXPORT.md](GOODREADS-EXPORT.md) for matching, the one-book Gouged experiment, and importer limitations.
+
+**Listening stats** combines ABS completion with measured BookRamp sessions, reporting source/actual hours, weighted speed, time saved, and a downloadable monthly PNG card. Missing telemetry remains unavailable. Create/revoke write-only BookRamp tokens here; no token is put in Git or URLs. The optional native receiver uses `/api/v1/bookramp/status` and `/api/v1/bookramp/sessions`. See [BOOKRAMP-INTEGRATION.md](BOOKRAMP-INTEGRATION.md) for the sender contract, duplicate handling, offline behavior and the existing Cloudflare gateway requirement. This build does not modify BookRamp or weaken private phone access.
+
 ## Local development
 
 Python 3.14. The Cloudflare JWT verifier uses PyJWT and its cryptography dependency:

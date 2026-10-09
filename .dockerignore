@@ -5,6 +5,9 @@
 !notifications.py
 !ai.py
 !covers.py
+!goodreads.py
+!telemetry.py
+!cards.py
 !requirements.txt
 !static/
 !static/**

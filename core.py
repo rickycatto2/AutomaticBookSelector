@@ -488,6 +488,7 @@ class Store:
             feedback = {r['book_id']: dict(r) for r in db.execute('SELECT * FROM feedback')}
             queued = {r[0] for r in db.execute('SELECT book_id FROM queue')}
             profile = self.meta(db, 'profile')
+            ramp_finished = {r[0] for r in db.execute('SELECT abs_item_id FROM bookramp_sessions WHERE completion_crossed=1')} if db.execute("SELECT 1 FROM sqlite_master WHERE name='bookramp_sessions'").fetchone() else set()
         # Match seed history by ISBN or title AND author; never by title alone.
         by_key, by_isbn = {}, {}
         read_keys, read_isbns = set(), set()
@@ -549,7 +550,7 @@ class Store:
         pos_norm = math.sqrt(sum(v * v for v in positives.values())) or 1
         neg_norm = math.sqrt(sum(v * v for v in negatives.values())) or 1
         read_feedback_keys = {(b['title_key'], b['author_key']) for b in books if feedback.get(b['id'], {}).get('rating') or feedback.get(b['id'], {}).get('dnf')}
-        abs_finished_keys = {(b['title_key'], b['author_key']) for b in books if b['finished']}
+        abs_finished_keys = {(b['title_key'], b['author_key']) for b in books if b['finished'] or b['id'] in ramp_finished}
         results = []
         for b in books:
             key = (b['title_key'], b['author_key'])

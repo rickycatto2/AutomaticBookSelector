@@ -13,6 +13,9 @@ from access import AccessPolicy
 from notifications import Notifications
 from ai import AI
 from covers import Covers
+from goodreads import Goodreads
+from telemetry import Telemetry, EventConflict
+from cards import card_png
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -22,16 +25,20 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
     notifications = notifications or Notifications(store)
     ai = ai or AI(store)
     covers = covers or Covers(store)
+    telemetry = Telemetry(store)
+    goodreads = Goodreads(store)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             # No request payloads, credentials, server URL or upstream response body.
             pass
 
-        def respond(self, code, payload, content_type='application/json'):
+        def respond(self, code, payload, content_type='application/json', filename=None):
             data = json.dumps(payload).encode() if content_type == 'application/json' else payload
             self.send_response(code)
             self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', str(len(data)))
+            if filename:
+                self.send_header('Content-Disposition', 'attachment; filename="' + filename + '"')
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
@@ -43,6 +50,12 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
             return access_policy.authorize(self.headers)
 
         def do_GET(self):
+            if self.path == '/api/v1/bookramp/status':
+                if not access_policy.host_kind(self.headers.get('Host')) or not telemetry.authenticate(self.headers):
+                    self.respond(401, {'error': 'Invalid or revoked BookRamp token.'})
+                else:
+                    self.respond(200, telemetry.status())
+                return
             if not self.authorized():
                 self.respond(403, {'error': 'Sign in through Cloudflare Access, or use the local app address.'})
                 return
@@ -57,6 +70,22 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
                     self.respond(200, store.feedback_book(params.get('id', [''])[0]))
                 elif parsed.path == '/api/reviews':
                     self.respond(200, store.reviews(params.get('search', [''])[0]))
+                elif parsed.path == '/api/goodreads':
+                    self.respond(200, goodreads.review())
+                elif parsed.path == '/api/goodreads/batch':
+                    self.respond(200, goodreads.batch(params.get('id', [''])[0]))
+                elif parsed.path == '/api/goodreads/download':
+                    batch = goodreads.batch(params.get('id', [''])[0])
+                    self.respond(200, batch['csv'].encode('utf-8-sig'), 'text/csv; charset=utf-8', batch['filename'])
+                elif parsed.path == '/api/goodreads/batch-items':
+                    self.respond(200, goodreads.batch_items(params.get('id', [''])[0]))
+                elif parsed.path == '/api/bookramp/connections':
+                    self.respond(200, telemetry.connections())
+                elif parsed.path == '/api/stats':
+                    self.respond(200, telemetry.stats(params.get('month', [''])[0]))
+                elif parsed.path == '/api/card.png':
+                    stats = telemetry.stats(params.get('month', [''])[0])
+                    self.respond(200, card_png(stats), 'image/png', 'my-listening-' + stats['month'] + '.png')
                 elif parsed.path == '/api/recommendations':
                     self.respond(200, ai.recommendations(params.get('library', [''])[0], params.get('search', [''])[0]))
                 elif parsed.path == '/api/cover':
@@ -67,7 +96,7 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
                         self.respond(404, {'error': 'No cover available.'})
                 elif parsed.path == '/api/playlists':
                     self.respond(200, {'playlists': store.playlists(params.get('library', [''])[0])})
-                elif parsed.path in ('/', '/app.js', '/style.css'):
+                elif parsed.path in ('/', '/app.js', '/companion.js', '/style.css'):
                     filename = 'index.html' if parsed.path == '/' else parsed.path.lstrip('/')
                     kind = mimetypes.guess_type(filename)[0] or 'text/plain'
                     self.respond(200, (ROOT / 'static' / filename).read_bytes(), kind + '; charset=utf-8')
@@ -79,6 +108,30 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
                 self.respond(500, {'error': 'The app could not complete this request.'})
 
         def do_POST(self):
+            if self.path == '/api/v1/bookramp/sessions':
+                connection = telemetry.authenticate(self.headers) if access_policy.host_kind(self.headers.get('Host')) else None
+                if not connection:
+                    self.respond(401, {'error': 'Invalid or revoked BookRamp token.'})
+                    return
+                if self.headers.get('Origin') is not None:
+                    self.respond(403, {'error': 'Session ingestion is for the paired native client.'})
+                    return
+                try:
+                    length = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < length <= 1024 * 1024:
+                        self.respond(413, {'error': 'Batch exceeds 1 MB.'})
+                        return
+                    result = telemetry.ingest(json.loads(self.rfile.read(length)), connection)
+                    self.respond(200, result)
+                except EventConflict as error:
+                    self.respond(409, {'error': str(error)})
+                except AppError as error:
+                    self.respond(400, {'error': str(error)})
+                except (ValueError, UnicodeError):
+                    self.respond(400, {'error': 'Malformed JSON batch.'})
+                except Exception:
+                    self.respond(500, {'error': 'No acknowledgement is available. Retry with the same event IDs.'})
+                return
             if not self.authorized() or self.headers.get('X-Selector-Request') != '1':
                 self.respond(403, {'error': 'Sign in to the app before making changes.'})
                 return
@@ -119,6 +172,18 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
                         result = notifications.test()
                     elif self.path == '/api/feedback':
                         result = store.feedback(payload)
+                    elif self.path == '/api/goodreads/save':
+                        result = goodreads.save(payload)
+                    elif self.path == '/api/goodreads/lookup':
+                        result = goodreads.lookup(payload)
+                    elif self.path == '/api/goodreads/export':
+                        result = goodreads.export(payload.get('book_ids'))
+                    elif self.path == '/api/goodreads/reconcile':
+                        result = goodreads.reconcile(payload)
+                    elif self.path == '/api/bookramp/create':
+                        result = telemetry.create(payload)
+                    elif self.path == '/api/bookramp/revoke':
+                        result = telemetry.revoke(payload)
                     elif self.path == '/api/questions/dismiss':
                         result = store.dismiss_question(payload.get('book_id'))
                     elif self.path == '/api/queue':
