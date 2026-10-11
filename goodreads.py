@@ -92,6 +92,7 @@ def page_metadata(body):
             walk(json.loads(script))
         except (ValueError, RecursionError):
             continue
+    candidates = []
     for book in books:
         details = book.get('details') or {}
         code = valid_isbn(book.get('isbn') or details.get('isbn13') or details.get('isbn'))
@@ -100,7 +101,13 @@ def page_metadata(body):
             if isinstance(authors, dict):
                 authors = [authors]
             author = ', '.join(a.get('name', '') for a in authors if isinstance(a, dict)) if isinstance(authors, list) else str(authors)
-            return {'isbn': code, 'title': book.get('name') or book.get('title') or '', 'author': author}
+            candidate = {'isbn': code, 'title': book.get('name') or book.get('title') or '', 'author': author}
+            if candidate not in candidates:
+                candidates.append(candidate)
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        raise AppError('This page contains multiple books or ISBN editions. Open the intended edition and copy its title, author and ISBN for manual review.')
     raise AppError('This page did not provide a usable ISBN. Open Book details & editions and paste an ISBN from a print edition below.')
 
 
@@ -154,11 +161,13 @@ class Goodreads:
         return {'books': books, 'excluded': excluded, 'batches': batches}
 
     def save(self, p):
+        if any(k in p and type(p[k]) is not bool for k in ('confirmed', 'ignored')):
+            raise AppError('Match confirmation and skip flags must be boolean values.')
         if any(not isinstance(p.get(k, ''), str) for k in ('title', 'author', 'isbn', 'url', 'completed_date')):
             raise AppError('Book details must be text values.')
         title, author = p.get('title', '').strip(), p.get('author', '').strip()
         if not title or not author or max(len(title), len(author)) > 1000 or title[0] in '=+-@' or author[0] in '=+-@':
-            raise AppError('Enter the correct title and primary author (up to 1,000 characters each).')
+            raise AppError('Enter the correct title and author(s) (up to 1,000 characters each).')
         code = str(p.get('isbn', '')).strip()
         if code and not valid_isbn(code):
             raise AppError('That ISBN has an invalid format or checksum. Use 10 or 13 digits, preserving leading zeros.')

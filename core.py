@@ -50,18 +50,19 @@ def author_parts(author):
 
 
 def canonical_author(author, known):
-    # Some ABS metadata includes narrators in authorName. Match an exact known
-    # Goodreads/preferred author component, never a surname or fuzzy name.
-    matches = author_parts(author) & known
-    return next(iter(matches)) if len(matches) == 1 else normalize(author)
+    # Knowing one contributor from history does not prove that other names are
+    # narrators. Preserve the complete authored identity until metadata is reviewed.
+    return normalize(author)
 
 
 def isbn(value):
     code = re.sub(r'[^0-9Xx]', '', str(value or '')).upper()
     if len(code) == 10:
+        if not re.fullmatch(r'\d{9}[\dX]', code) or sum((10-i) * (10 if n == 'X' else int(n)) for i, n in enumerate(code)) % 11:
+            return ''
         body = '978' + code[:9]
         code = body + str((10 - sum(int(n) * (1 if i % 2 == 0 else 3) for i, n in enumerate(body)) % 10) % 10)
-    return code if len(code) == 13 and code.isdigit() else ''
+    return code if len(code) == 13 and code.isdigit() and sum(int(n) * (1 if i % 2 == 0 else 3) for i, n in enumerate(code)) % 10 == 0 else ''
 
 
 def plain(value):

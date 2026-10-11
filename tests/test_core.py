@@ -159,13 +159,13 @@ class StoreTests(unittest.TestCase):
         self.store.import_csv(export([{'Book Id': '1', 'Title': 'One', 'Author': 'Different Writer', 'My Rating': '4', 'Exclusive Shelf': 'read'}]))
         self.assertIn('one', [b['id'] for b in self.store.recommendations()['books']])
 
-    def test_seed_matches_author_component_with_extra_abs_names(self):
+    def test_seed_does_not_assume_extra_abs_names_are_narrators(self):
         self.abs.items = [item('one', 'One', author='Writer, Narrator Person'), item('two', 'Two', author='Writer, Narrator Person')]
         self.store.sync()
         self.store.import_csv(export([{'Book Id': '1', 'Title': 'One', 'Author': 'Writer', 'My Rating': '5', 'Exclusive Shelf': 'read'}]))
         picks = self.store.recommendations()['books']
-        self.assertEqual([b['id'] for b in picks], ['two'])
-        self.assertIn('You rated other books by this author highly', picks[0]['reasons'])
+        self.assertEqual({b['id'] for b in picks}, {'one', 'two'})
+        self.assertTrue(all('You rated other books by this author highly' not in b['reasons'] for b in picks))
 
     def test_queue_creates_adds_then_retry_deduplicates(self):
         payload = {'library_id': 'lib', 'book_ids': ['one', 'one', 'two']}
