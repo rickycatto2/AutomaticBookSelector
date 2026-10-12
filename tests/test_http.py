@@ -1,10 +1,10 @@
+import http.client
 import json
 import pathlib
+import socket
 import tempfile
 import threading
 import unittest
-import urllib.error
-import urllib.request
 from http.server import ThreadingHTTPServer
 
 from core import Store
@@ -31,16 +31,28 @@ class HTTPTests(unittest.TestCase):
         self.temp.cleanup()
 
     def request(self, path, payload=None, headers=None):
-        data = json.dumps(payload).encode() if payload is not None else None
-        req = urllib.request.Request(f'http://127.0.0.1:{self.port}' + path, data=data, headers=headers or {})
-        if data is not None and not req.has_header('Content-type'):
-            req.add_header('Content-Type', 'application/json')
-        try:
-            with urllib.request.urlopen(req, timeout=5) as response:
+        data = json.dumps(payload).encode() if payload is not None else b''
+        method = 'POST' if payload is not None else 'GET'
+        supplied = dict(headers or {})
+        host = supplied.pop('Host', f'127.0.0.1:{self.port}')
+        if payload is not None and not any(key.lower() == 'content-type' for key in supplied):
+            supplied['Content-Type'] = 'application/json'
+        lines = [method + ' ' + path + ' HTTP/1.1', 'Host: ' + host]
+        lines.extend(key + ': ' + value for key, value in supplied.items())
+        if payload is not None:
+            lines.append('Content-Length: ' + str(len(data)))
+        wire = ('\r\n'.join(lines) + '\r\n\r\n').encode('iso-8859-1') + data
+        with socket.create_connection(('127.0.0.1', self.port), timeout=5) as connection:
+            # Headers and body leave in one write, so the handler's first read takes both. It answers
+            # 403 without reading the body, and a body left unread in the socket makes Windows reset
+            # the connection before the response can be read.
+            connection.sendall(wire)
+            response = http.client.HTTPResponse(connection, method=method)
+            response.begin()
+            try:
                 return response.status, response.headers, response.read()
-        except urllib.error.HTTPError as error:
-            with error:
-                return error.code, error.headers, error.read()
+            finally:
+                response.close()
 
     def test_page_and_state_do_not_expose_credentials(self):
         status, headers, body = self.request('/')

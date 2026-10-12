@@ -2,6 +2,7 @@
 import http.client
 import json
 import pathlib
+import socket
 import tempfile
 import threading
 import unittest
@@ -69,23 +70,28 @@ class MachineHTTPTests(unittest.TestCase):
         self.temp.cleanup()
 
     def request(self, method, path, headers=(), body=b'', token=True, host='native.example.test'):
-        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
-        try:
-            conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
-            conn.putheader('Host', host)
-            if token:
-                conn.putheader('Authorization', 'Bearer ' + self.connection['token'])
-            for key, value in headers:
-                conn.putheader(key, value)
-            if not any(k.lower() == 'content-length' for k, _ in headers):
-                conn.putheader('Content-Length', str(len(body)))
-            if not any(k.lower() == 'content-type' for k, _ in headers):
-                conn.putheader('Content-Type', 'application/json')
-            conn.endheaders(body)
-            response = conn.getresponse()
-            return response.status, response.read()
-        finally:
-            conn.close()
+        if method == 'HEAD':
+            body = b''  # HEAD carries no request body; the handler may answer before it could read one.
+        request = [method + ' ' + path + ' HTTP/1.1', 'Host: ' + host]
+        if token:
+            request.append('Authorization: Bearer ' + self.connection['token'])
+        request.extend(key + ': ' + value for key, value in headers)
+        if not any(key.lower() == 'content-length' for key, _ in headers):
+            request.append('Content-Length: ' + str(len(body)))
+        if not any(key.lower() == 'content-type' for key, _ in headers):
+            request.append('Content-Type: application/json')
+        wire = ('\r\n'.join(request) + '\r\n\r\n').encode('iso-8859-1') + body
+        with socket.create_connection(('127.0.0.1', self.server.server_port), timeout=5) as connection:
+            # Headers and body leave in one write, so the handler's first read takes both. Answering
+            # while the body is still unread makes Windows reset the connection before the response
+            # is read: that is what made HEAD-with-body (and every other unrouted body) flaky.
+            connection.sendall(wire)
+            response = http.client.HTTPResponse(connection, method=method)
+            response.begin()
+            try:
+                return response.status, response.read()
+            finally:
+                response.close()
 
     def test_exact_method_path_matrix_even_with_browser_credentials(self):
         paths = [STATUS, SESSIONS, '/', '/api/health', '/api/state', '/api/import', '/api/reviews',
@@ -105,6 +111,14 @@ class MachineHTTPTests(unittest.TestCase):
                     code, _ = self.request(method, path, forged, b'{"sessions":[]}')
                     expected = 200 if (method, path) == ('GET', STATUS) else 400 if (method, path) == ('POST', SESSIONS) else 404
                     self.assertEqual(code, expected)
+        # Explicitly: a real upload body sent to any other route is refused before the body is read,
+        # so a payload can never widen the method/path match above.
+        upload = json.dumps({'sessions': [self.session]}).encode()
+        for path in (STATUS, '/', '/api/v1/bookramp/sessions/', '/api/import'):
+            with self.subTest(method='POST', path=path, body='valid upload'):
+                self.assertEqual(self.request('POST', path, forged, upload)[0], 404)
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM bookramp_sessions').fetchone()[0], 0)
 
     def test_wrong_host_case_and_port(self):
         for host in ('native.example.test', 'NATIVE.EXAMPLE.TEST', 'native.example.test:443'):
