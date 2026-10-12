@@ -230,6 +230,64 @@ class ExportAutomationTests(unittest.TestCase):
         with self.store.db() as db:
             self.assertEqual(db.execute('SELECT count(*) FROM gr_matches').fetchone()[0], 0)
 
+    def test_no_action_auto_prefill_and_no_repeat_or_failed_lookup(self):
+        with patch.object(self.gr.catalog, 'request', return_value=GOOGLE) as request:
+            self.assertTrue(self.gr.auto_resolve()['results'][0]['automatic'])
+            self.assertTrue(self.gr.review()['books'][0]['ready'])
+            self.gr.auto_last = -100
+            self.assertEqual(self.gr.auto_resolve()['results'], [])
+            batch = self.gr.export(['one'])
+            self.gr.reconcile({'batch_id': batch['id'], 'failed_ids': ['one']})
+            self.assertEqual(self.gr.auto_resolve()['results'], [])
+            self.assertEqual(request.call_count, 1)
+
+    def test_auto_uncertainty_cached_budget_pacing_and_source_invalidation(self):
+        bad = copy.deepcopy(GOOGLE)
+        bad['items'][0]['volumeInfo']['authors'] = ['Other Writer']
+        with patch.object(self.gr.catalog, 'request', return_value=bad) as request:
+            result = self.gr.auto_resolve()
+            self.assertFalse(result['results'][0]['automatic'])
+            self.assertIn('author mismatch', self.gr.review()['books'][0]['reason'])
+            self.assertTrue(self.gr.auto_resolve()['deferred'])
+            self.gr.auto_last = -100
+            self.assertEqual(self.gr.auto_resolve()['results'], [])
+            self.assertEqual(request.call_count, 1)
+            self.abs.items[0]['media']['metadata']['language'] = 'German'
+            self.store.sync()
+            self.gr.auto_budget *= 10
+            self.assertTrue(self.gr.auto_resolve()['deferred'])
+            self.gr.auto_budget = []
+            self.assertEqual(len(self.gr.auto_resolve()['results']), 1)
+            self.assertEqual(request.call_count, 2)
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM gr_matches').fetchone()[0], 0)
+
+    def test_incident_missing_language_and_narrator_authors_make_no_requests(self):
+        for metadata in ({'title': 'The Wildest Dreams Bookshop', 'authorName': 'Gracie Page, Venice Van Someren', 'language': '', 'narratorName': 'Venice Van Someren'},
+                         {'title': 'Cleat Cute', 'authorName': 'Dana Varden, Zim Avaltrades', 'language': 'english', 'narratorName': 'Dana Varden, Zim Avaltrades'}):
+            self.abs.items[0]['media']['metadata'].update(metadata)
+            self.store.sync()
+            self.gr.auto_last = -100
+            with patch.object(self.gr.catalog, 'request') as request:
+                self.assertFalse(self.gr.auto_resolve()['results'][0]['automatic'])
+                request.assert_not_called()
+
+    def test_3000_book_queue_never_launches_per_book_catalog_requests(self):
+        for index in range(3000):
+            book = item('synthetic-' + str(index), 'Synthetic work ' + str(index))
+            book['media']['metadata'].update(language='English', narratorName='Voice')
+            self.abs.items.append(book)
+            self.abs.user['mediaProgress'].append({'libraryItemId': book['id'], 'isFinished': True,
+                                                   'finishedAt': '2026-10-01T18:00:00Z'})
+        self.store.sync()
+        with patch.object(self.gr.catalog, 'request', return_value={'items': [], 'docs': []}) as request:
+            for _ in range(12):
+                self.gr.auto_last = -100  # simulate independently paced list loads
+                self.gr.auto_resolve()
+            self.assertEqual(len(self.gr.auto_budget), 10)
+            self.assertEqual(request.call_count, 20)  # at most two providers per book
+            self.assertEqual(len(self.gr.review()['books']), 3001)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -238,6 +238,7 @@ class ReceiverHTTPTests(test_http.HTTPTests):
         for headers in ({}, {'X-Selector-Request': '1', 'Origin': 'https://evil.example'},
                         {'X-Selector-Request': '1', 'Host': 'attacker.example'}):
             self.assertEqual(self.request('/api/goodreads/resolve', {'book_ids': ['one']}, headers)[0], 403)
+            self.assertEqual(self.request('/api/goodreads/auto-resolve', {}, headers)[0], 403)
 
     def test_catalog_resolution_api_uses_source_metadata_not_client_search_or_private_feedback(self):
         from test_isbn_catalog import GOOGLE
@@ -250,6 +251,19 @@ class ReceiverHTTPTests(test_http.HTTPTests):
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)['results'][0]['automatic'])
         self.assertNotIn('private', str(request.call_args_list))
+
+    def test_auto_resolution_api_ignores_client_metadata_and_has_no_get_side_effect(self):
+        from test_isbn_catalog import GOOGLE
+        with self.store.db() as db:
+            db.execute("UPDATE books SET finished=1,finished_at='2026-10-01',language='English' WHERE id='one'")
+        with patch('isbn_catalog.Catalog.request', return_value=GOOGLE) as request:
+            self.assertEqual(self.request('/api/goodreads')[0], 200)
+            request.assert_not_called()
+            status, _, body = self.request('/api/goodreads/auto-resolve', {'title': 'PRIVATE'}, {'X-Selector-Request': '1'})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)['results'][0]['automatic'])
+        self.assertEqual(request.call_count, 1)
+        self.assertNotIn('PRIVATE', str(request.call_args_list))
 
 
 if __name__ == '__main__':

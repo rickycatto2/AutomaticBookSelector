@@ -28,7 +28,8 @@ def import_report(text, items):
     a title/author substring or from a success row in a mixed report.
     """
     failed, succeeded, reasons = set(), set(), {}
-    ambiguous, section = False, ''
+    ambiguous, section, table = False, '', False
+    expected_failures, table_rows = None, 0
     failure = r'(?:could not import|unable to import|failed(?: to import)?|not imported|error|rejected)'
     success = r'(?:successfully imported|imported successfully|imported|success|successful)'
     for raw in text.splitlines():
@@ -36,6 +37,21 @@ def import_report(text, items):
         if not line:
             continue
         clean = normalize(line)
+        if re.fullmatch(r'\d+ books? could not be imported\s*:', line, re.I):
+            if expected_failures is not None:
+                ambiguous = True
+            expected_failures = int(line.split()[0])
+            section, table = 'failed', False
+            continue
+        if section == 'failed' and re.fullmatch(r'ISBN\s+Title\s+Author', line, re.I):
+            table = True
+            continue
+        # Goodreads supplies tab-delimited rows, including a blank Title.
+        # Do not inherit failure context into arbitrary prose or success rows.
+        cells = line.split('\t')
+        table_row = bool(table and len(cells) == 3 and valid_isbn(cells[0].strip()))
+        if table_row:
+            table_rows += 1
         if clean in ('failed books', 'failed imports', 'errors', 'rejected books'):
             section = 'failed'
             continue
@@ -47,6 +63,8 @@ def import_report(text, items):
         negative = bool(re.match(r'^' + failure + r'\s*[:\-]', line, re.I))
         # Remove negative phrases before checking positive status ("not imported").
         positive = bool(re.search(r'\b' + success + r'\b', re.sub(failure, '', line, flags=re.I), re.I))
+        if table_row:
+            positive = False
         status = 'success' if positive else 'failed' if negative else section
         payload = re.sub(r'^\s*(?:' + failure + '|' + success + r')\s*[:\-]\s*', '', line, flags=re.I)
         if section and not negative and not positive:
@@ -54,9 +72,11 @@ def import_report(text, items):
             # arbitrary prose mentioning an ISBN (e.g. "no errors for ISBN").
             bare_code = valid_isbn(re.sub(r'^ISBN\s*:\s*', '', payload, flags=re.I))
             bare_work = any(normalize(payload) == normalize(b['title'] + ' by ' + b['author']) for b in items)
-            if not bare_code and not bare_work:
+            if not bare_code and not bare_work and not table_row:
                 status = ''
         codes = {canonical_isbn(valid_isbn(m.group())) for m in re.finditer(r'(?<![\w-])(?:\d[ -]?){9,}[\dXx](?![\w-])', line)} - {''}
+        if table_row:
+            codes = {canonical_isbn(valid_isbn(cells[0].strip()))}
         matches = [b for b in items if (valid_isbn(b['isbn']) and canonical_isbn(b['isbn']) in codes)
                    or normalize(payload) == normalize(b['title'] + ' by ' + b['author'])]
         if len(matches) != 1 or not status or (negative and positive):
@@ -71,7 +91,7 @@ def import_report(text, items):
         else:
             failed.add(book_id)
             reasons[book_id] = line[:500]
-    if failed & succeeded:
+    if failed & succeeded or (expected_failures is not None and table_rows != expected_failures):
         ambiguous = True
     failed -= succeeded
     return failed, succeeded, reasons, ambiguous
@@ -191,6 +211,10 @@ class Goodreads:
         self.lookup_lock = threading.Lock()
         self.last_lookup = 0
         self.catalog = Catalog()
+        self.auto_lock = threading.Lock()
+        self.auto_attempts = {}
+        self.auto_budget = []
+        self.auto_last = -100
         with store.lock, store.db() as db:
             db.executescript('''CREATE TABLE IF NOT EXISTS gr_matches (
                 book_id TEXT PRIMARY KEY,title TEXT NOT NULL,author TEXT NOT NULL,isbn TEXT NOT NULL DEFAULT '',
@@ -212,7 +236,10 @@ class Goodreads:
             read_titles = {work_identity(h) for h in history if h['shelf'] == 'read' or h['date_read'] or h['read_count']}
             seeds = {work_identity(h): h for h in history}
             matches = {r['book_id']: dict(r) for r in db.execute('SELECT * FROM gr_matches')}
-            exported = [dict(r) for r in db.execute("SELECT * FROM gr_export_items WHERE state IN ('exported','imported')")]
+            exported = [dict(r) for r in db.execute("""SELECT i.* FROM gr_export_items i
+                JOIN gr_exports e ON e.id=i.batch_id WHERE i.state IN ('exported','imported')
+                AND NOT EXISTS (SELECT 1 FROM gr_export_items newer JOIN gr_exports ne ON ne.id=newer.batch_id
+                    WHERE newer.book_id=i.book_id AND ne.rowid>e.rowid)""")]
             exports = {work_identity(r) for r in exported}
             exported_ids = {r['book_id'] for r in exported}
             contexts = {r['book_id']: dict(r) for r in db.execute('SELECT * FROM gr_match_context')}
@@ -225,7 +252,8 @@ class Goodreads:
                 count(i.book_id) AS count,sum(i.state='failed') AS failed,sum(i.state='imported') AS imported
                 FROM gr_exports e JOIN gr_export_items i ON i.batch_id=e.id GROUP BY e.id ORDER BY e.created_at DESC LIMIT 20''')]
         seen, books, excluded = set(), [], 0
-        for b in sorted(rows, key=lambda b: str(b['finished_at'] or b['ramp_finished'] or ''), reverse=True):
+        # Keep the actual rejected ABS ID visible ahead of duplicate editions.
+        for b in sorted(rows, key=lambda b: (b['id'] in failures, str(b['finished_at'] or b['ramp_finished'] or '')), reverse=True):
             key = work_identity(b)
             match = matches.get(b['id'], {})
             if b['dnf'] or key in read_titles or key in exports or b['id'] in exported_ids or key in seen or match.get('ignored'):
@@ -246,6 +274,12 @@ class Goodreads:
                 saved['reason'] = 'Source metadata changed or prior confirmation has no source snapshot. Re-review required; saved details retained.'
             saved['ready'] = bool(not saved['source_changed'] and saved['confirmed'] and valid_isbn(saved['isbn']) and genuine_date(saved['completed_date']) and saved['title'] and saved['author'])
             saved['automatic'] = bool(context.get('automatic'))
+            attempt = self.auto_attempts.get(saved['source_snapshot'])
+            if attempt and time.monotonic() - attempt[0] < 86400 and not match:
+                suggestion = attempt[1]
+                saved['reason'] = suggestion['reason']
+                saved['provenance'] = suggestion.get('provenance') or 'Automatic catalog check'
+                saved['suggestion'] = suggestion.get('candidate')
             books.append(saved)
         return {'books': books, 'excluded': excluded, 'batches': batches}
 
@@ -325,6 +359,34 @@ class Goodreads:
                                      'reason': result['reason'] + ('' if automatic else ' Not auto-saved: review candidate, existing decision and completion date.')})
         return {'results': results}
 
+    def auto_resolve(self):
+        """One book per list load, ten per rolling day/process; never a bulk job.
+
+        Fingerprint attempts (including uncertainty/errors) are cached for a day.
+        Existing decisions and failed imports are never sent or overwritten.
+        """
+        if not self.auto_lock.acquire(blocking=False):
+            return {'results': [], 'deferred': True}
+        try:
+            stamp = time.monotonic()
+            self.auto_budget = [s for s in self.auto_budget if stamp - s < 86400]
+            self.auto_attempts = {k: v for k, v in self.auto_attempts.items() if stamp - v[0] < 86400}
+            if len(self.auto_budget) >= 10 or stamp - self.auto_last < 5:
+                return {'results': [], 'deferred': True}
+            with self.store.lock, self.store.db() as db:
+                saved_ids = {r[0] for r in db.execute('SELECT book_id FROM gr_matches')}
+                book = next((b for b in self.review()['books'] if b['id'] not in saved_ids
+                             and not b['failure'] and b['source_snapshot'] not in self.auto_attempts), None)
+            if not book:
+                return {'results': [], 'deferred': False}
+            self.auto_budget.append(stamp)
+            self.auto_last = stamp
+            result = self.resolve({'book_ids': [book['id']]})
+            self.auto_attempts[book['source_snapshot']] = (stamp, result['results'][0])
+            return result | {'deferred': False}
+        finally:
+            self.auto_lock.release()
+
     def lookup(self, p):
         url, gr_id = book_url(p.get('url', ''))
         with self.lookup_lock:
@@ -396,7 +458,9 @@ class Goodreads:
             if set(selected) & succeeded:
                 raise AppError('Selected book has a success line. Remove that line or correct the selection before marking a failure.')
             manual = bool(selected)
-            chosen = set(selected) if 'failed_ids' in p else detected
+            # A manual/empty selection cannot silently erase explicit failures
+            # and then confirm those rejected books as imported.
+            chosen = set(selected) | detected
             unresolved = ambiguous and not manual
             # Empty input is always a no-op, even with remaining confirmation.
             no_op = not text.strip() and not selected

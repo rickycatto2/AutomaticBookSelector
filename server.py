@@ -216,6 +216,8 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
                         result = goodreads.lookup(payload)
                     elif self.path == '/api/goodreads/resolve':
                         result = goodreads.resolve(payload)
+                    elif self.path == '/api/goodreads/auto-resolve':
+                        result = goodreads.auto_resolve()
                     elif self.path == '/api/goodreads/export':
                         result = goodreads.export(payload.get('book_ids'))
                     elif self.path == '/api/goodreads/reconcile':

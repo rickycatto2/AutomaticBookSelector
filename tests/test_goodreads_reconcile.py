@@ -34,6 +34,52 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual([b['id'] for b in self.gr.review()['books']], ['two'])
         self.assertEqual(self.gr.batch(batch['id'])['csv'], batch['csv'])
 
+    def test_actual_goodreads_blank_title_report_requeues_without_csv_changes(self):
+        batch = self.batch()
+        with self.store.db() as db:
+            db.execute("UPDATE gr_export_items SET title='Cleat Cute',author='Dana Varden, Zim Avaltrades',isbn='9781250292896' WHERE book_id='one'")
+        text = '1 book could not be imported:\nISBN\tTitle\tAuthor\n9781250292896\t\tDana Varden, Zim Avaltrades'
+        payload = {'batch_id': batch['id'], 'text': text, 'confirm_remaining': True, 'failed_ids': []}
+        preview = self.gr.reconcile(payload | {'preview': True})
+        self.assertEqual(preview['flagged'], ['Cleat Cute'])
+        self.assertFalse(preview['ambiguous'])
+        self.assertEqual(self.states(batch)['one'], 'exported')
+        self.gr.reconcile(payload)
+        self.assertEqual(self.states(batch), {'one': 'failed', 'two': 'imported'})
+        self.assertEqual([b['id'] for b in self.gr.review()['books']], ['one'])
+        self.assertFalse(self.gr.review()['books'][0]['ready'])
+        self.assertEqual(self.gr.batch(batch['id'])['csv'], batch['csv'])
+
+    def test_table_count_malformed_shared_and_success_rows_are_conservative(self):
+        items = [{'book_id': 'one', 'title': 'One', 'author': 'Writer', 'isbn': '9781250292896'}]
+        header = '1 book could not be imported:\nISBN\tTitle\tAuthor\n'
+        self.assertTrue(import_report(header + '9781250292896\t\tWriter', items)[0])
+        for text in (header + 'No errors for ISBN 9781250292896',
+                     header + '9781250292896\tWriter',
+                     header + 'Imported: 9781250292896'):
+            failed, _, _, ambiguous = import_report(text, items)
+            self.assertFalse(failed)
+            self.assertTrue(ambiguous)
+        self.assertTrue(import_report(header.replace('1 book', '2 books') + '9781250292896\t\tWriter', items)[3])
+        self.assertFalse(import_report(header + '9781250292896\t\tWriter', items + [items[0] | {'book_id': 'two'}])[0])
+
+    def test_latest_failed_state_not_masked_by_older_export_record(self):
+        batch = self.batch()
+        with self.store.db() as db:
+            db.execute("INSERT INTO gr_exports VALUES ('synthetic-later','2026-10-12','retained')")
+            db.execute("INSERT INTO gr_export_items SELECT 'synthetic-later',book_id,title_key,title,author,isbn,'failed','Rejected' FROM gr_export_items WHERE book_id='one'")
+        self.assertEqual([b['id'] for b in self.gr.review()['books']], ['one'])
+        self.assertEqual(self.states(batch)['one'], 'exported')
+
+    def test_failed_abs_id_kept_visible_ahead_of_newer_duplicate_completion(self):
+        self.finish('one')
+        self.match('one')
+        batch = self.gr.export(['one'])
+        self.abs.items[1]['media']['metadata']['title'] = 'One'
+        self.finish('two', '2026-10-02T18:00:00Z')
+        self.gr.reconcile({'batch_id': batch['id'], 'failed_ids': ['one']})
+        self.assertEqual([b['id'] for b in self.gr.review()['books']], ['one'])
+
     def test_no_context_unknown_empty_and_nonbool_do_not_import(self):
         batch = self.batch()
         for text in ('', '   ', '9780306406157', 'One by Writer', 'Upload failed', 'unknown format',
