@@ -235,6 +235,21 @@ class ReceiverHTTPTests(test_http.HTTPTests):
     def test_new_private_endpoints_require_existing_access_auth(self):
         for path in ('/api/goodreads', '/api/goodreads/batch?id=x', '/api/stats?month=2026-10', '/api/bookramp/connections'):
             self.assertEqual(self.request(path, headers={'Host':'attacker.example'})[0], 403)
+        for headers in ({}, {'X-Selector-Request': '1', 'Origin': 'https://evil.example'},
+                        {'X-Selector-Request': '1', 'Host': 'attacker.example'}):
+            self.assertEqual(self.request('/api/goodreads/resolve', {'book_ids': ['one']}, headers)[0], 403)
+
+    def test_catalog_resolution_api_uses_source_metadata_not_client_search_or_private_feedback(self):
+        from test_isbn_catalog import GOOGLE
+        with self.store.db() as db:
+            db.execute("UPDATE books SET finished=1,finished_at='2026-10-01',language='English' WHERE id='one'")
+        with patch('isbn_catalog.Catalog.request', return_value=GOOGLE) as request:
+            status, _, body = self.request('/api/goodreads/resolve',
+                {'book_ids': ['one'], 'title': 'Client private text', 'url': 'http://localhost/private'},
+                {'X-Selector-Request': '1'})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)['results'][0]['automatic'])
+        self.assertNotIn('private', str(request.call_args_list))
 
 
 if __name__ == '__main__':

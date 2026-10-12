@@ -6,6 +6,7 @@
 !ai.py
 !covers.py
 !goodreads.py
+!isbn_catalog.py
 !telemetry.py
 !cards.py
 !requirements.txt
