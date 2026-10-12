@@ -49,10 +49,35 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
         def authorized(self):
             return access_policy.authorize(self.headers)
 
+        def parse_request(self):
+            if not super().parse_request():
+                return False
+            # Reject ambiguous security/framing headers rather than trusting the first.
+            for name in ('Host', 'Authorization', 'Origin', 'Content-Length', 'Content-Type',
+                         'Cf-Access-Jwt-Assertion', 'X-Selector-Request'):
+                if len(self.headers.get_all(name, [])) > 1:
+                    self.respond(400, {'error': 'Duplicate request header.'})
+                    return False
+            if self.headers.get('Transfer-Encoding') is not None:
+                self.respond(400, {'error': 'Transfer encoding is not supported.'})
+                return False
+            target = self.raw_requestline.decode('iso-8859-1').split()[1]
+            if access_policy.host_kind(self.headers.get('Host')) == 'machine':
+                if (self.command, target) not in (
+                        ('GET', '/api/v1/bookramp/status'), ('POST', '/api/v1/bookramp/sessions')):
+                    self.respond(404, {'error': 'Native route not found.'})
+                    return False
+            if target != self.path and self.path.startswith('/api/v1/bookramp/'):
+                self.respond(404, {'error': 'Native route not found.'})
+                return False
+            return True
+
         def do_GET(self):
             if self.path == '/api/v1/bookramp/status':
-                if not access_policy.host_kind(self.headers.get('Host')) or not telemetry.authenticate(self.headers):
+                if not access_policy.native_host_allowed(self.headers) or not telemetry.authenticate(self.headers):
                     self.respond(401, {'error': 'Invalid or revoked BookRamp token.'})
+                elif self.headers.get('Origin') is not None:
+                    self.respond(403, {'error': 'Status is for the paired native client.'})
                 else:
                     self.respond(200, telemetry.status())
                 return
@@ -109,7 +134,7 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
 
         def do_POST(self):
             if self.path == '/api/v1/bookramp/sessions':
-                connection = telemetry.authenticate(self.headers) if access_policy.host_kind(self.headers.get('Host')) else None
+                connection = telemetry.authenticate(self.headers) if access_policy.native_host_allowed(self.headers) else None
                 if not connection:
                     self.respond(401, {'error': 'Invalid or revoked BookRamp token.'})
                     return
@@ -117,11 +142,24 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
                     self.respond(403, {'error': 'Session ingestion is for the paired native client.'})
                     return
                 try:
-                    length = int(self.headers.get('Content-Length', '0'))
+                    if self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json':
+                        self.respond(400, {'error': 'Use application/json.'})
+                        return
+                    size = self.headers.get('Content-Length', '0')
+                    if not size.isascii() or not size.isdecimal():
+                        raise ValueError('Invalid Content-Length.')
+                    length = int(size)
                     if not 0 < length <= 1024 * 1024:
                         self.respond(413, {'error': 'Batch exceeds 1 MB.'})
                         return
-                    result = telemetry.ingest(json.loads(self.rfile.read(length)), connection)
+                    def unique_object(pairs):
+                        result = {}
+                        for key, value in pairs:
+                            if key in result:
+                                raise ValueError('Duplicate JSON key.')
+                            result[key] = value
+                        return result
+                    result = telemetry.ingest(json.loads(self.rfile.read(length), object_pairs_hook=unique_object), connection)
                     self.respond(200, result)
                 except EventConflict as error:
                     self.respond(409, {'error': str(error)})

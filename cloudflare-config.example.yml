@@ -1,7 +1,16 @@
-# Copy to .cloudflare/config.yml and fill in values after creating an Access app.
+# Reference only; do not apply without approval. Replace all placeholders locally.
 tunnel: YOUR_TUNNEL_UUID
 credentials-file: /etc/cloudflared/tunnel.json
 ingress:
+  # Optional single-receiver-token native API. Separate hostname, NOT the UI host.
+  # cloudflared filters paths, not methods; the app checks exact method + raw target.
+  - hostname: bookramp.yourdomain.com
+    path: '^/api/v1/bookramp/(status|sessions)$'
+    service: http://selector:5077
+  # Prevent non-native paths on this hostname from reaching the app.
+  - hostname: bookramp.yourdomain.com
+    service: http_status:404
+  # Human UI stays behind Access including tunnel audience enforcement.
   - hostname: selector.yourdomain.com
     service: http://selector:5077
     originRequest:

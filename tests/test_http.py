@@ -33,6 +33,8 @@ class HTTPTests(unittest.TestCase):
     def request(self, path, payload=None, headers=None):
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(f'http://127.0.0.1:{self.port}' + path, data=data, headers=headers or {})
+        if data is not None and not req.has_header('Content-type'):
+            req.add_header('Content-Type', 'application/json')
         try:
             with urllib.request.urlopen(req, timeout=5) as response:
                 return response.status, response.headers, response.read()
