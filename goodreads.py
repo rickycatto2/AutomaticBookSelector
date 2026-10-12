@@ -202,7 +202,7 @@ def page_metadata(body):
         return candidates[0]
     if candidates:
         raise AppError('This page contains multiple books or ISBN editions. Open the intended edition and copy its title, author and ISBN for manual review.')
-    raise AppError('This page did not provide a usable ISBN. Open Book details & editions and paste an ISBN from a print edition below.')
+    raise AppError('This page did not provide a usable ISBN. Audiobook pages often list only an ASIN. Use Find print/ebook edition to locate the work, open Book details & editions on a print or ebook edition, and paste its ISBN below — or try Find work ISBN (free catalogs) first.')
 
 
 class Goodreads:
