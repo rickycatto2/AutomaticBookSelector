@@ -40,6 +40,41 @@ BROAD_SOURCE = SOURCE | {'title': 'The Synthetic Long Work', 'author': 'Writer; 
 
 
 class CatalogTests(unittest.TestCase):
+    def test_approved_subtitle_and_roles_require_unanimous_catalog_identity(self):
+        google = copy.deepcopy(GOOGLE)
+        google['items'][0]['volumeInfo']['subtitle'] = 'A Novel'
+        for author in ('Writer', 'Voice', 'Voice - narrator'):
+            result, request = self.resolve(google=google, source=SOURCE | {'author': author})
+            self.assertTrue(result['high_confidence'])
+            self.assertEqual(result['score'], 100)
+            self.assertEqual(result['candidate']['author'], 'Writer')
+            self.assertEqual(result['candidate']['title'], 'One: A Novel')
+            if author != 'Writer':
+                self.assertEqual(request.call_args.args[1]['q'], 'One')
+                self.assertNotIn('self-narration', result['reason'])
+        # A role label cannot justify removing an unlabelled coauthor.
+        result, _ = self.resolve(source=SOURCE | {'author': 'Writer; Coauthor; Voice - narrator'})
+        self.assertFalse(result['high_confidence'])
+        google['items'][0]['volumeInfo']['authors'] = ['Writer', 'Coauthor']
+        result, _ = self.resolve(google=google, source=SOURCE | {'author': 'Writer; Coauthor; Voice - narrator'})
+        self.assertTrue(result['high_confidence'])
+        self.assertEqual(result['candidate']['author'], 'Writer, Coauthor')
+        other = copy.deepcopy(google['items'][0])
+        other['volumeInfo']['authors'] = ['Someone Else']
+        google['items'].append(other)
+        self.assertFalse(self.resolve(google=google, source=SOURCE | {'author': 'Voice'})[0]['high_confidence'])
+
+    def test_conflicting_catalog_subtitle_or_volume_vetoes_even_exact_candidate(self):
+        for suffix in ('A Different Subtitle', 'Volume 2', 'Part 3', '#4'):
+            google = copy.deepcopy(GOOGLE_BROAD)
+            google['items'][0]['volumeInfo']['subtitle'] = 'A Novel'
+            other = copy.deepcopy(google['items'][0])
+            other['volumeInfo']['subtitle'] = suffix
+            google['items'].append(other)
+            result, request = self.resolve(google=google, source=BROAD_SOURCE)
+            self.assertFalse(result['high_confidence'])
+            self.assertEqual(request.call_count, 1)
+
     def resolve(self, google=GOOGLE, library=OPEN, source=SOURCE):
         catalog = Catalog()
         with patch.object(catalog, 'request', side_effect=[google, library]) as request:
@@ -107,7 +142,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_broad_google_payload_subtitle_series_volume_vetoes(self):
         for change in ({'subtitle': 'Volume 2'}, {'subtitle': 'Book 3'},
-                       {'subtitle': 'Part 4'}, {'subtitle': 'A Novel'},
+                       {'subtitle': 'Part 4'},
                        {'title': 'The Synthetic Long Work (Series #1)'},
                        {'title': 'The Synthetic Long Work (Volume 2)'}):
             google = copy.deepcopy(GOOGLE_BROAD)
@@ -236,7 +271,7 @@ class CatalogTests(unittest.TestCase):
         other['volumeInfo']['authors'] = ['Different Writer']
         google['items'].append(other)
         self.assertFalse(self.resolve(google=google)[0]['high_confidence'])
-        google['items'][0]['volumeInfo']['title'] = 'One: A Different Work'
+        google['items'][0]['volumeInfo']['title'] = 'One: Volume 2'
         self.assertFalse(self.resolve(google=google, library={'docs': []})[0]['high_confidence'])
         google['totalItems'] = 20
         self.assertFalse(self.resolve(google=google)[0]['high_confidence'])
@@ -266,7 +301,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(valid_isbn('0000000000000'), '')
 
     def test_unsafe_source_and_explicit_contributor_roles_never_silently_fixed(self):
-        for source in (SOURCE | {'author': 'Writer, Translator - translator'}, SOURCE | {'author': ''},
+        for source in (SOURCE | {'author': ''},
                        SOURCE | {'title': '=formula'}, SOURCE | {'author': 'x' * 1001}):
             result, request = self.resolve(source=source)
             self.assertFalse(result['high_confidence'])
@@ -284,7 +319,7 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(result['high_confidence'])
         self.assertIn('self-narration', result['reason'])
         result, request = self.resolve(source=SOURCE | {'author': 'Voice'})
-        self.assertFalse(result['high_confidence'])
+        self.assertTrue(result['high_confidence'])
         self.assertEqual(request.call_count, 1)
 
     def test_multiple_editions_deterministic_print_preference(self):
@@ -309,18 +344,18 @@ class CatalogTests(unittest.TestCase):
         self.assertFalse(self.resolve(google={'items': []}, library=library)[0]['high_confidence'])
         google = copy.deepcopy(GOOGLE)
         google['items'][0]['volumeInfo']['title'] = 'The Synthetic Long Work: A Subtitle'
-        # A catalog-added subtitle never auto-confirms a bare source title.
+        # A catalog-added subtitle is an approved edition difference.
         result, _ = self.resolve(google=google, library={'docs': []},
                                  source=SOURCE | {'title': 'The Synthetic Long Work'})
-        self.assertFalse(result['high_confidence'])
-        self.assertIn('review required', result['reason'])
+        self.assertTrue(result['high_confidence'])
+        self.assertEqual(result['score'], 100)
         self.assertFalse(self.resolve(google=google, library={'docs': []},
                          source=SOURCE | {'title': 'The Synthetic Long Work: Different Subtitle'})[0]['high_confidence'])
 
-    def test_series_position_and_catalog_added_subtitles_never_auto_confirm(self):
+    def test_series_position_subtitles_never_auto_confirm(self):
         # Reported false positive: same author, catalog title names a later volume.
         for suffix, fragment in (('Volume 2', 'volume'), ('Book 3', 'volume'), ('Part 4', 'volume'),
-                                 ('#5', 'volume'), ('A Novel', 'subtitle')):
+                                 ('#5', 'volume')):
             google = copy.deepcopy(GOOGLE)
             google['items'][0]['volumeInfo']['title'] = 'Long Enough Name: ' + suffix
             result, _ = self.resolve(google=google, library={'docs': []},
@@ -389,6 +424,105 @@ class CatalogTests(unittest.TestCase):
 
 
 class ExportAutomationTests(unittest.TestCase):
+    def test_catalog_subtitle_and_narrator_author_saved_visible_and_exported(self):
+        self.abs.items[0]['media']['metadata']['authorName'] = 'Voice - narrator'
+        self.store.sync()
+        google = copy.deepcopy(GOOGLE)
+        google['items'][0]['volumeInfo']['subtitle'] = 'A Novel'
+        with patch.object(self.gr.catalog, 'request', return_value=google):
+            self.assertTrue(self.gr.resolve({'book_ids': ['one']})['results'][0]['automatic'])
+        row = self.gr.review()['books'][0]
+        self.assertEqual(row['original_author'], 'Voice - narrator')
+        self.assertEqual(row['author'], 'Writer')
+        self.assertEqual(row['title'], 'One: A Novel')
+        exported = list(csv.DictReader(io.StringIO(self.gr.export(['one'])['csv'])))[0]
+        self.assertEqual(exported['Author'], 'Writer')
+        self.assertEqual(exported['Title'], 'One: A Novel')
+
+    def test_narrator_equal_source_uses_full_catalog_coauthors_in_export(self):
+        self.abs.items[0]['media']['metadata']['authorName'] = 'Voice'
+        self.store.sync()
+        google = copy.deepcopy(GOOGLE)
+        google['items'][0]['volumeInfo']['authors'] = ['Writer', 'Coauthor']
+        with patch.object(self.gr.catalog, 'request', return_value=google):
+            result = self.gr.resolve({'book_ids': ['one']})['results'][0]
+        self.assertTrue(result['automatic'])
+        self.assertNotIn('self-narration', result['reason'])
+        row = self.gr.review()['books'][0]
+        self.assertEqual(row['original_author'], 'Voice')
+        self.assertEqual(row['author'], 'Writer, Coauthor')
+        exported = list(csv.DictReader(io.StringIO(self.gr.export(['one'])['csv'])))[0]
+        self.assertEqual(exported['Author'], 'Writer, Coauthor')
+
+    def test_recheck_exact_subset_durable_claim_idempotence_and_overwrite(self):
+        cases = {'one': {}, 'ambiguous': {'candidates': [{'title': 'Ambiguous'}]},
+                 'candidate': {'candidate': {'title': 'Candidate'}}, 'high': {'high_confidence': True},
+                 'provider': {'provider_error': True, 'provider_failures': [{'status': 'daily_quota'}]},
+                 'failed': {}, 'manual': {}, 'auto': {}, 'changed': {}, 'new': None,
+                 'interrupted': {'provider_error': True}, 'skipped': {'skipped': True}}
+        for book_id in cases:
+            if book_id != 'one':
+                self.abs.items.append(item(book_id, 'Work ' + book_id))
+                self.abs.user['mediaProgress'].append({'libraryItemId': book_id, 'isFinished': True, 'finishedAt': '2026-10-01'})
+        self.store.sync()
+        with self.store.db() as db:
+            for b in self.gr.review()['books']:
+                outcome = cases[b['id']]
+                if outcome is not None:
+                    db.execute('INSERT INTO gr_catalog_attempts VALUES (?,?,?)',
+                               (b['id'], b['source_snapshot'], json.dumps({'reason': 'No match', 'high_confidence': False} | outcome)))
+            db.execute("INSERT INTO gr_exports VALUES ('failed-batch','2026-10-01','')")
+            db.execute("INSERT INTO gr_export_items(batch_id,book_id,title_key,title,author,isbn,state,failure) VALUES ('failed-batch','failed','work failed','Work failed','Writer','','failed','Rejected')")
+        for book_id in ('manual', 'auto'):
+            self.gr.save({'book_id': book_id, 'title': 'Work ' + book_id, 'author': 'Writer', 'isbn': '0306406152',
+                          'completed_date': '2026-10-01', 'confirmed': book_id == 'auto'})
+        with self.store.db() as db:
+            db.execute("UPDATE gr_match_context SET automatic=1 WHERE book_id='auto'")
+        self.abs.items[next(i for i, b in enumerate(self.abs.items) if b['id'] == 'changed')]['media']['metadata']['language'] = 'German'
+        self.store.sync()
+        with patch.object(self.gr.catalog, 'resolve') as lookup:
+            job = self.gr.recheck_books()['job']
+            self.assertEqual({b['id'] for b in job['items']}, {'one', 'ambiguous'})
+            self.assertEqual(self.gr.recheck_books()['job'], job)
+            lookup.assert_not_called()
+        with self.store.db() as db:
+            before = db.execute('SELECT count(*) FROM gr_catalog_attempts').fetchone()[0]
+        def fresh(source):
+            with self.store.db() as db:
+                claim = json.loads(db.execute('SELECT result FROM gr_catalog_attempts WHERE book_id=? AND source_snapshot=?',
+                                              (source['id'], source_snapshot(source))).fetchone()[0])
+            self.assertTrue(claim['provider_error'])
+            self.assertIn('in flight', claim['reason'])
+            return {'candidate': None, 'high_confidence': False, 'reason': 'Fresh no match'}
+        with patch.object(self.gr.catalog, 'resolve', side_effect=fresh) as lookup:
+            payload = {'book_ids': ['one'], 'batch_id': job['id']}
+            self.gr.resolve(payload)
+            self.gr.resolve(payload)
+            self.assertEqual(lookup.call_count, 1)
+            with self.assertRaises(AppError):
+                self.gr.resolve({'book_ids': ['one', 'ambiguous'], 'batch_id': job['id']})
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM gr_catalog_attempts').fetchone()[0], before)
+            self.assertTrue(json.loads(db.execute("SELECT result FROM gr_catalog_attempts WHERE book_id='one'").fetchone()[0])['reason'].startswith('Fresh no match'))
+
+    def test_recheck_cap_and_decision_race(self):
+        for i in range(30):
+            self.abs.items.append(item('recheck-' + str(i), 'Recheck work ' + str(i)))
+            self.abs.user['mediaProgress'].append({'libraryItemId': 'recheck-' + str(i), 'isFinished': True, 'finishedAt': '2026-10-01'})
+        self.store.sync()
+        with self.store.db() as db:
+            for b in self.gr.review()['books']:
+                db.execute('INSERT INTO gr_catalog_attempts VALUES (?,?,?)', (b['id'], b['source_snapshot'], '{"reason":"Nothing found"}'))
+        job = self.gr.recheck_books()['job']
+        self.assertEqual(len(job['items']), 25)
+        book_id = job['items'][0]['id']
+        self.gr.save({'book_id': book_id, 'title': 'Saved work', 'author': 'Writer', 'isbn': '0306406152',
+                      'completed_date': '2026-10-01', 'confirmed': False})
+        with patch.object(self.gr.catalog, 'resolve') as lookup:
+            result = self.gr.resolve({'book_ids': [book_id], 'batch_id': job['id']})
+            lookup.assert_not_called()
+        self.assertEqual(result['job']['items'][0]['state'], 'skipped')
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)

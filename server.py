@@ -220,6 +220,8 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
                         result = goodreads.start_match_batch()
                     elif self.path == '/api/goodreads/retry-provider':
                         result = goodreads.retry_provider_books()
+                    elif self.path == '/api/goodreads/recheck':
+                        result = goodreads.recheck_books()
                     elif self.path == '/api/goodreads/auto-resolve':
                         result = goodreads.auto_resolve()
                     elif self.path == '/api/goodreads/export':

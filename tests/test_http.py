@@ -111,6 +111,22 @@ class HTTPTests(unittest.TestCase):
         self.server.RequestHandlerClass = handler(self.store, self.port, policy)
         headers = {'Host': 'selector.example.com', 'Origin': 'https://selector.example.com', 'X-Selector-Request': '1'}
         self.assertEqual(self.request(path, {}, headers)[0], 403)
+
+        headers['Cf-Access-Jwt-Assertion'] = 'valid-test-token'
+        self.assertEqual(self.request(path, {}, headers)[0], 200)
+        headers['Origin'] = 'https://attacker.example'
+        self.assertEqual(self.request(path, {}, headers)[0], 403)
+
+    def test_recheck_requires_authentication_and_origin(self):
+        path = '/api/goodreads/recheck'
+        self.assertEqual(self.request(path, {})[0], 403)
+        self.assertEqual(self.request(path, {}, {'X-Selector-Request': '1', 'Origin': 'https://attacker.example'})[0], 403)
+        self.assertEqual(self.request(path, {}, {'X-Selector-Request': '1', 'Origin': f'http://127.0.0.1:{self.port}'})[0], 200)
+        policy = AccessPolicy(self.port, 'https://selector.example.com', 'https://reader.cloudflareaccess.com', 'audience', 'reader@example.com')
+        policy.verify = lambda token: token == 'valid-test-token'
+        self.server.RequestHandlerClass = handler(self.store, self.port, policy)
+        headers = {'Host': 'selector.example.com', 'Origin': 'https://selector.example.com', 'X-Selector-Request': '1'}
+        self.assertEqual(self.request(path, {}, headers)[0], 403)
         headers['Cf-Access-Jwt-Assertion'] = 'valid-test-token'
         self.assertEqual(self.request(path, {}, headers)[0], 200)
         headers['Origin'] = 'https://attacker.example'

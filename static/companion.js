@@ -14,7 +14,7 @@ async function matchEligibleBooks(retryProvider = false) {
   $('#gr-match-eligible').disabled = true; $('#gr-match-cancel').hidden = false;
   $('#gr-books').inert = true; $('#gr-reload').disabled = true;
   try {
-    const response = await api(retryProvider === true ? '/api/goodreads/retry-provider' : '/api/goodreads/match-batch', {}); grMatchJob = response.job;
+    const response = await api(retryProvider === 'recheck' ? '/api/goodreads/recheck' : retryProvider === true ? '/api/goodreads/retry-provider' : '/api/goodreads/match-batch', {}); grMatchJob = response.job;
     if (!grMatchJob) {grMatchProgress('No eligible undecided books. Review existing suggestions per book.'); return;}
     // The server owns the bounded durable queue; never iterate the Goodreads seed.
     for (const item of grMatchJob.items.filter(i => i.state === 'queued').slice(0, 25)) {
@@ -87,6 +87,10 @@ async function loadGoodreads(automatic = true) {
     if (book.retry_eligible) {
       const retry = el('button', 'secondary', 'Retry provider-blocked books (up to 25)'); retry.type = 'button';
       retry.addEventListener('click', () => matchEligibleBooks(true)); card.append(retry);
+    }
+    if (book.recheck_eligible) {
+      const recheck = el('button', 'secondary', 'Re-check nothing found / ambiguous books (up to 25)'); recheck.type = 'button';
+      recheck.addEventListener('click', () => matchEligibleBooks('recheck')); card.append(recheck);
     }
     if (book.evidence?.length) card.append(el('p', 'muted', `Evidence score ${book.score}/100 · auto threshold ${book.threshold} plus linked ISBN identity. Edition/language differences are allowed; Goodreads acceptance remains unverified.`));
     const lookupError = el('p', 'error-note'); lookupError.hidden = true; lookupError.setAttribute('role', 'alert'); card.append(lookupError);

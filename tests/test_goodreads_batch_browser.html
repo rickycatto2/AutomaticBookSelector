@@ -28,7 +28,8 @@
     w.api = async (path, payload) => {
       if (path === '/api/goodreads') return {books, batches: [], excluded: 3000, match_job: structuredClone(job)};
       if (path === '/api/goodreads/match-batch') {job ||= {id: 'synthetic-job', items: books.filter(b => b.match_eligible !== false || b.retry_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
-      if (path === '/api/goodreads/retry-provider') {job = {id: 'synthetic-retry', items: books.filter(b => b.retry_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
+       if (path === '/api/goodreads/retry-provider') {job = {id: 'synthetic-retry', items: books.filter(b => b.retry_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
+       if (path === '/api/goodreads/recheck') {job ||= {id: 'synthetic-recheck', items: books.filter(b => b.recheck_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
       if (path === '/api/goodreads/resolve') {
         assert(payload.book_ids.length === 1, 'exactly one ABS ID per request');
         const entry = job.items.find(i => i.id === payload.book_ids[0]);
@@ -89,7 +90,21 @@
    [...w.$('#gr-books').firstElementChild.querySelectorAll('button')].find(b => b.textContent === 'Retry provider-blocked books (up to 25)').click(); await tick();
    assert(job.items.length === 19 && job.items.every(i => i.state === 'queued'), 'retry button queues legacy-blocked set');
    w.$('#gr-match-cancel').click(); await tick();
-   document.querySelector('#result').textContent = 'PASS: progress, 5-second rate, 25 cap, pause (waiting/in-flight), page-close resume, partial decisions and counts, honest blocked cards, explicit provider retry, and both buttons queue 19 legacy-blocked books.';
+    books.forEach((book, i) => Object.assign(book, {recheck_eligible: i > 0, retry_eligible: i === 0, provider_error: i === 0}));
+    job = null; await mount();
+    const recheck = [...w.$('#gr-books').children[1].querySelectorAll('button')].find(b => b.textContent === 'Re-check nothing found / ambiguous books (up to 25)');
+    assert(recheck, 'explicit re-check control offered');
+    const beforeRecheck = calls.length; recheck.click(); await tick();
+    assert(job.items.length === 25 && job.items.every(i => i.id !== books[0].id), 're-check cap and provider exclusion');
+    for (let i = 0; i < 25; i++) await advance();
+    assert(calls.length === beforeRecheck + 25 && !w.$('#gr-books').inert, 're-check one-book pacing and controls restored');
+    assert(calls.slice(beforeRecheck).every((c, i, rows) => !i || c.clock - rows[i-1].clock >= 5000), 're-check five-second pacing');
+    books[1].original_author = 'Synthetic Voice - narrator'; books[1].author = 'Catalog Writer, Catalog Coauthor';
+    await mount();
+    const recoveredCard = w.$('#gr-books').children[1];
+    assert(recoveredCard.textContent.includes('Synthetic Voice - narrator'), 'original ABS author remains visibly available');
+    assert(recoveredCard.querySelector('input[name=author]').value === 'Catalog Writer, Catalog Coauthor', 'saved form uses full catalog authors');
+    document.querySelector('#result').textContent = 'PASS: progress, 5-second rate, 25 cap, pause (waiting/in-flight), page-close resume, partial decisions and counts, honest blocked cards, explicit provider retry, legacy-blocked queues, and paced bounded re-check with provider exclusion.';
   document.title = 'PASS matching browser tests';
 })().catch(error => {document.querySelector('#result').textContent = error.stack; document.title = 'FAIL matching browser tests';});
 </script>

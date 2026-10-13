@@ -52,17 +52,17 @@ def truncation_review(title, author, relevant, usable):
 
     Provider page limits make totalItems > 10 ordinary for popular titles, so
     a truncated result can still be confirmed automatically when every
-    relevant candidate agrees on one work identity: the exact source work
-    title key, the full source author set, no conflicting subtitle or volume
+    relevant candidate agrees on one work identity: an accepted exact work
+    title key, the corroborated full author set, no conflicting subtitle or volume
     marker, and a checksum-valid ISBN on every candidate. Any disagreement
     among them, or a candidate without a usable ISBN, keeps the book in
     review. Returns '' only when that agreement holds.
     """
     keys = {work_title(c['title']) for c in relevant}
-    if len(keys) > 1 or keys != {work_title(title)}:
-        return 'Truncated search, but matching candidates do not all agree on one work title; review required.'
     if {volume_marker(c['title']) for c in relevant} - {volume_marker(title)}:
         return 'Truncated search, but matching candidates carry conflicting volume or series markers; review required.'
+    if len(keys) > 1 or not all(title_evidence(c['title'], title)[0] == 40 for c in relevant):
+        return 'Truncated search, but matching candidates do not all agree on one work title; review required.'
     if {authors(c['author']) for c in relevant} != {authors(author)}:
         return 'Truncated search, but matching candidates disagree on the full author set; review required.'
     if len(usable) != len(relevant):
@@ -73,10 +73,9 @@ def truncation_review(title, author, relevant, usable):
 def title_evidence(left, right):
     """Points plus reason for a catalog title (left) against the source (right).
 
-    Only an exact normalized work title, or a source that adds a non-series
-    subtitle to a bare catalog title, can reach the automatic threshold. Every
-    volume/part/numbered-series or conflicting added subtitle returns 0 so the
-    book stays in review with that reason.
+    Catalog-added non-series subtitles count as exact work evidence. Source-only
+    subtitles retain the conservative base-length rule. Conflicting subtitles
+    and volume/part/series markers never count as edition differences.
     """
     if work_title(left) == work_title(right):
         if normalize(left) == normalize(right):
@@ -89,9 +88,11 @@ def title_evidence(left, right):
     # No fuzzy cross-work matching: bases must be identical, specific and long.
     a, b = left.split(':', 1), right.split(':', 1)
     base = work_title(a[0])
-    if base != work_title(b[0]) or len(base.split()) < 3 or len(base) < 12:
+    if not base or base != work_title(b[0]):
         return 0, 'Work title not established'
     if len(a) == 1 and len(b) == 2:
+        if len(base.split()) < 3 or len(base) < 12:
+            return 0, 'Work title not established'
         extra = work_title(b[1])
         if SERIES_MARK.search(extra):
             return 0, 'Source subtitle names a volume, part or numbered series; review required'
@@ -100,13 +101,44 @@ def title_evidence(left, right):
         extra = work_title(a[1])
         if SERIES_MARK.search(extra):
             return 0, 'Catalog title names a volume, part or numbered series the source lacks; review required'
-        return 0, 'Catalog adds a subtitle the source lacks; review required'
+        return 40, 'Catalog-added subtitle; exact base work title'
     return 0, 'Conflicting subtitles may identify different works; review required'
 
 
 def authors(value):
     parts = re.split(r'\s*(?:,|;| & | and )\s*', value or '', flags=re.I)
     return tuple(sorted(normalize(p) for p in parts if p.strip()))
+
+
+ROLE_WORDS = re.compile(r'\b(?:translator|narrator|translated|narrated)\b', re.I)
+
+
+def catalog_author_evidence(source, relevant):
+    """Corroborate roles, never rewrite/strip the original ABS author string.
+
+    A unanimous non-role catalog author set may replace narrator-filled metadata.
+    Unlabelled source contributors other than known narrators must all be retained;
+    this prevents using a role label as permission to silently drop a coauthor.
+    """
+    author = source['author']
+    narrator_set = set(authors(source.get('narrator', '')))
+    role_filled = bool(ROLE_WORDS.search(author))
+    narrator_filled = bool(narrator_set and set(authors(author)) == narrator_set)
+    sets = {authors(c['author']) for c in relevant}
+    if len(sets) != 1 or any(ROLE_WORDS.search(c['author']) for c in relevant):
+        return False, False
+    catalog_set = set(next(iter(sets)))
+    if not catalog_set:
+        return False, False
+    if not (role_filled or narrator_filled):
+        return catalog_set == set(authors(author)), False
+    unlabelled = set()
+    for part in re.split(r'\s*(?:,|;| & | and )\s*', author, flags=re.I):
+        if not ROLE_WORDS.search(part):
+            unlabelled.update(authors(part))
+    if unlabelled - narrator_set - catalog_set:
+        return False, False
+    return True, catalog_set != set(authors(author))
 
 
 def language(value):
@@ -234,13 +266,15 @@ class Catalog:
             return base | {'reason': 'Unsafe or missing title/author fields; manual review required.'}
         if not work_title(title) or not authors(author):
             return base | {'reason': 'Missing work or full author; manual review required.'}
-        if re.search(r'\b(?:translator|narrator|translated|narrated)\b', author, re.I):
-            return base | {'reason': 'Contributor roles are uncertain; correct/review authors without silently dropping names.'}
+        role_source = bool(ROLE_WORDS.search(author) or (authors(source.get('narrator', ''))
+                           and authors(author) == authors(source.get('narrator', ''))))
         errors, failures = [], []
         genuine_outcome = False
         for provider in ENDPOINTS:
             try:
-                candidates, truncated = self.search(provider, title, author)
+                # A known contributor-filled field would filter out the real author.
+                # Title-only retrieval stays inside the same request/result bounds.
+                candidates, truncated = self.search(provider, title, '' if role_source else author)
             except ProviderFailure as exc:
                 failures.append(exc.failure)
                 errors.append(str(exc))
@@ -258,8 +292,7 @@ class Catalog:
                 elif why != 'Work title not established' and not conflict:
                     conflict = why
             if conflict:
-                genuine_outcome = True
-                errors.append(provider + ': ' + conflict)
+                return base | {'provenance': provider, 'candidates': relevant, 'reason': conflict}
             if not relevant:
                 continue
             genuine_outcome = True
@@ -267,7 +300,8 @@ class Catalog:
             if any(not isinstance(v, str) or not v.strip() or len(v) > 1000 or v.lstrip()[0] in '=+-@'
                    for c in relevant for v in (c['title'], c['author'])):
                 return result | {'reason': 'Unsafe catalog title/author fields; manual review required.'}
-            if any(authors(c['author']) != authors(author) for c in relevant):
+            author_ok, replaced_author = catalog_author_evidence(source, relevant)
+            if not author_ok:
                 return result | {'reason': 'Same-title author mismatch or ambiguous works; review required.'}
             subtitles = {work_title(c['title']) for c in relevant if ':' in c['title']}
             if len(subtitles) > 1:
@@ -280,7 +314,8 @@ class Catalog:
                 return result | {'reason': 'Multiple distinct catalog works; review required.'}
             # A truncated page is review only when its candidates disagree; a
             # unanimous exact work identity is relaxed, never a wrong work.
-            blocked = truncation_review(title, author, relevant, usable) if truncated else ''
+            catalog_author = relevant[0]['author']
+            blocked = truncation_review(title, catalog_author, relevant, usable) if truncated else ''
             if blocked:
                 return result | {'reason': blocked}
             if not usable:
@@ -296,7 +331,7 @@ class Catalog:
                 editions = [(e, valid_isbn(i)) for e in c.get('editions', [])
                             if str(e.get('key', '')).startswith('/books/')
                             and title_evidence(e.get('title', ''), title)[0]
-                            and authors(', '.join(e.get('author_name') or [])) == authors(author)
+                            and authors(', '.join(e.get('author_name') or [])) == authors(catalog_author)
                             for i in e.get('isbn', []) if valid_isbn(i)]
                 if editions:
                     e, code = min(editions, key=lambda pair: (len(pair[1]) != 13, pair[1], pair[0]['key']))
@@ -305,14 +340,16 @@ class Catalog:
             evidence = [title_why + f' (+{points})', 'Independent catalog corroborates full author set (+35)',
                         'Checksum-valid catalog ISBN (+15)', 'Linked edition identity (+10)' if linked else 'Work-index ISBN lacks edition/author linkage (+0)']
             score = points + 35 + 15 + (10 if linked else 0)
+            if replaced_author:
+                evidence.append('Contributor-filled ABS author retained for review; unanimous catalog full author set used for save/export')
             same_language = language(source.get('language')) and {language(v) for v in c['languages']} == {language(source.get('language'))}
             evidence.append('Edition difference: unknown/different language is neutral (+0)' if not same_language else 'Matching language (neutral +0)')
-            if authors(author) == authors(source.get('narrator', '')):
+            if authors(author) == authors(source.get('narrator', '')) and authors(author) == authors(catalog_author):
                 evidence.append('Possible self-narration: full author set independently corroborated')
             if truncated:
                 evidence.append('Truncated search, but every matching candidate agrees on the same work title and full author set (neutral +0)')
-            # Automatic confirmation needs an exact work title, or a clean one-sided
-            # source subtitle with no conflicting catalog title in the same results.
+            # Automatic confirmation needs exact/approved added-subtitle work
+            # evidence, or a clean conservative source-only subtitle match.
             title_ok = points == 40 or not conflict
             high = linked and score >= base['threshold'] and title_ok
             candidate = {'title': c['title'], 'author': c['author'], 'isbn': code, 'reference': c['reference']}

@@ -323,6 +323,12 @@ class Goodreads:
             saved['provider_error'] = bool(persisted and persisted.get('provider_error') and not match and not saved['failure'])
             saved['provider_failures'] = evidence.get('provider_failures', [])
             saved['retry_eligible'] = bool(not match and not saved['failure'] and persisted and retryable_provider_result(persisted))
+            saved['recheck_eligible'] = bool(
+                not match and not saved['failure'] and persisted
+                and not persisted.get('candidate') and not persisted.get('high_confidence')
+                and not persisted.get('automatic') and not persisted.get('provider_error')
+                and not persisted.get('provider_failures') and not persisted.get('skipped')
+                and not any(i == b['id'] and snapshot != saved['source_snapshot'] for i, snapshot in attempts))
             if saved['retry_eligible'] and LEGACY_CATALOG_BLOCK in persisted.get('reason', ''):
                 saved['lookup_status'] = 'Previous catalog lookup was blocked by a request failure. It can be retried; no match decision was made.'
             if persisted and not match:
@@ -379,6 +385,22 @@ class Goodreads:
                            [(job_id, b['id'], b['source_snapshot'], '{"provider_retry":true}') for b in books])
         return {'job': self.match_job(job_id)}
 
+    def recheck_books(self):
+        """Explicit retry of no-candidate/ambiguous outcomes, not saved decisions."""
+        with self.store.lock, self.store.db() as db:
+            job = self.match_job()
+            if job and any(i['state'] in ('queued', 'pending') for i in job['items']):
+                # Repeated clicks resume the same queue, never enlarge it.
+                return {'job': job}
+            books = [b for b in self.review()['books'] if b['recheck_eligible']][:25]
+            if not books:
+                return {'job': job}
+            job_id = uuid.uuid4().hex
+            db.execute('INSERT INTO gr_match_jobs VALUES (?,?)', (job_id, now()))
+            db.executemany('INSERT INTO gr_match_job_items(job_id,book_id,source_snapshot,result) VALUES (?,?,?,?)',
+                           [(job_id, b['id'], b['source_snapshot'], '{"recheck":true}') for b in books])
+        return {'job': self.match_job(job_id)}
+
     def resolve_batch_item(self, p):
         ids, job_id = p.get('book_ids'), p.get('batch_id')
         if not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str) or not isinstance(job_id, str):
@@ -392,7 +414,8 @@ class Goodreads:
                 return {'results': [json.loads(row['result']) | {'id': book_id}], 'job': self.match_job(job_id)}
             book = next((b for b in self.review()['books'] if b['id'] == book_id), None)
             retry = json.loads(row['result']).get('provider_retry', False)
-            if not book or not (book['retry_eligible'] if retry else book['match_eligible']) or book['source_snapshot'] != row['source_snapshot']:
+            recheck = json.loads(row['result']).get('recheck', False)
+            if not book or not (book['recheck_eligible'] if recheck else book['retry_eligible'] if retry else book['match_eligible']) or book['source_snapshot'] != row['source_snapshot']:
                 result = {'id': book_id, 'automatic': False, 'reason': 'Skipped: decision, source or export state changed.'}
                 db.execute("UPDATE gr_match_job_items SET state='skipped',result=? WHERE job_id=? AND book_id=?",
                            (json.dumps(result), job_id, book_id))
