@@ -125,11 +125,54 @@ class CatalogTests(unittest.TestCase):
         self.assertFalse(self.resolve(google={'items': []}, library=library)[0]['high_confidence'])
         google = copy.deepcopy(GOOGLE)
         google['items'][0]['volumeInfo']['title'] = 'The Synthetic Long Work: A Subtitle'
-        result, _ = self.resolve(google=google, source=SOURCE | {'title': 'The Synthetic Long Work'})
-        self.assertTrue(result['high_confidence'])
-        self.assertEqual(result['score'], 95)
+        # A catalog-added subtitle never auto-confirms a bare source title.
+        result, _ = self.resolve(google=google, library={'docs': []},
+                                 source=SOURCE | {'title': 'The Synthetic Long Work'})
+        self.assertFalse(result['high_confidence'])
+        self.assertIn('review required', result['reason'])
         self.assertFalse(self.resolve(google=google, library={'docs': []},
                          source=SOURCE | {'title': 'The Synthetic Long Work: Different Subtitle'})[0]['high_confidence'])
+
+    def test_series_position_and_catalog_added_subtitles_never_auto_confirm(self):
+        # Reported false positive: same author, catalog title names a later volume.
+        for suffix, fragment in (('Volume 2', 'volume'), ('Book 3', 'volume'), ('Part 4', 'volume'),
+                                 ('#5', 'volume'), ('A Novel', 'subtitle')):
+            google = copy.deepcopy(GOOGLE)
+            google['items'][0]['volumeInfo']['title'] = 'Long Enough Name: ' + suffix
+            result, _ = self.resolve(google=google, library={'docs': []},
+                                     source=SOURCE | {'title': 'Long Enough Name'})
+            self.assertFalse(result['high_confidence'], suffix)
+            self.assertIn('review required', result['reason'])
+            self.assertIn(fragment, result['reason'])
+        # A source series suffix against a bare catalog title is review, not auto.
+        for suffix in ('Volume 2', 'Book 3', '#4'):
+            google = copy.deepcopy(GOOGLE)
+            google['items'][0]['volumeInfo']['title'] = 'Long Enough Name'
+            result, _ = self.resolve(google=google, library={'docs': []},
+                                     source=SOURCE | {'title': 'Long Enough Name: ' + suffix})
+            self.assertFalse(result['high_confidence'], suffix)
+            self.assertIn('Source subtitle names a volume, part or numbered series; review required', result['reason'])
+
+    def test_source_extra_subtitle_auto_confirms_only_without_series_markers(self):
+        for suffix, safe in (('A Short Subtitle', True), ('Volume 2', False), ('Book 3', False),
+                             ('Part 1', False), ('#2', False)):
+            google = copy.deepcopy(GOOGLE)
+            google['items'][0]['volumeInfo']['title'] = 'The Synthetic Long Work'
+            result, _ = self.resolve(google=google, library={'docs': []},
+                                     source=SOURCE | {'title': 'The Synthetic Long Work: ' + suffix})
+            self.assertEqual(result['high_confidence'], safe, suffix)
+            if safe:
+                self.assertEqual(result['score'], 95)
+            else:
+                self.assertIn('review required', result['reason'])
+
+    def test_trailing_series_marker_is_not_an_edition(self):
+        google = copy.deepcopy(GOOGLE)
+        google['items'][0]['volumeInfo']['title'] = 'Long Enough Name'
+        for suffix, safe in ((' (Series #1)', False), (' (The Book 3)', False), (' (Unabridged)', True)):
+            result, _ = self.resolve(google=google, library={'docs': []},
+                                     source=SOURCE | {'title': 'Long Enough Name' + suffix})
+            self.assertEqual(result['high_confidence'], safe, suffix)
 
     def test_bounded_transport_cache_rate_limit_and_ssrf(self):
         response = MagicMock()

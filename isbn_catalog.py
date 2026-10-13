@@ -12,20 +12,51 @@ ENDPOINTS = {'Google Books': 'https://www.googleapis.com/books/v1/volumes',
              'Open Library': 'https://openlibrary.org/search.json'}
 
 
+# Explicit series position markers. They identify a different work, not an edition.
+SERIES_MARK = re.compile(r'(?i)\b(?:volume|vol|book|part|issue|chapter|series|saga|trilogy|number)\b|#|\d')
+
+
 def work_title(value):
     return normalize(re.sub(r'\s*\((?:audio(?:book)? edition|unabridged|large print|ebook|[^()]+(?:\bbook|\bvolume|#)\s*\d+)\)\s*$', '', value or '', flags=re.I))
 
 
+def parenthetical(value):
+    match = re.search(r'\(([^()]*)\)\s*$', value or '')
+    return match.group(1) if match else ''
+
+
 def title_evidence(left, right):
+    """Points plus reason for a catalog title (left) against the source (right).
+
+    Only an exact normalized work title, or a source that adds a non-series
+    subtitle to a bare catalog title, can reach the automatic threshold. Every
+    volume/part/numbered-series or conflicting added subtitle returns 0 so the
+    book stays in review with that reason.
+    """
     if work_title(left) == work_title(right):
-        return 40, 'Exact normalized work title'
-    # Do not fuzz titles or discard two conflicting subtitles. A short/generic
-    # base is not enough evidence; author equality is also required by resolve.
+        if normalize(left) == normalize(right):
+            return 40, 'Exact normalized work title'
+        # work_title may drop a trailing series designator; that is not an edition.
+        tail_left, tail_right = parenthetical(left), parenthetical(right)
+        if tail_left != tail_right and (SERIES_MARK.search(tail_left) or SERIES_MARK.search(tail_right)):
+            return 0, 'Trailing series position marker differs between source and catalog; review required'
+        return 40, 'Exact work title after an edition marker'
+    # No fuzzy cross-work matching: bases must be identical, specific and long.
     a, b = left.split(':', 1), right.split(':', 1)
     base = work_title(a[0])
-    if len(a) != len(b) and base == work_title(b[0]) and len(base.split()) >= 3 and len(base) >= 12:
-        return 35, 'Conservative subtitle-insensitive work title'
-    return 0, 'Work title not established'
+    if base != work_title(b[0]) or len(base.split()) < 3 or len(base) < 12:
+        return 0, 'Work title not established'
+    if len(a) == 1 and len(b) == 2:
+        extra = work_title(b[1])
+        if SERIES_MARK.search(extra):
+            return 0, 'Source subtitle names a volume, part or numbered series; review required'
+        return 35, 'Conservative source-subtitle-insensitive work title'
+    if len(a) == 2 and len(b) == 1:
+        extra = work_title(a[1])
+        if SERIES_MARK.search(extra):
+            return 0, 'Catalog title names a volume, part or numbered series the source lacks; review required'
+        return 0, 'Catalog adds a subtitle the source lacks; review required'
+    return 0, 'Conflicting subtitles may identify different works; review required'
 
 
 def authors(value):
@@ -112,7 +143,15 @@ class Catalog:
             except (AppError, ValueError, TypeError, AttributeError) as exc:
                 errors.append(str(exc))
                 continue
-            relevant = [c for c in candidates if title_evidence(c['title'], title)[0]]
+            relevant, conflict = [], ''
+            for c in candidates:
+                points, why = title_evidence(c['title'], title)
+                if points:
+                    relevant.append(c)
+                elif why != 'Work title not established' and not conflict:
+                    conflict = why
+            if conflict:
+                errors.append(provider + ': ' + conflict)
             if not relevant:
                 continue
             result = base | {'provenance': provider, 'candidates': relevant}
@@ -158,11 +197,15 @@ class Catalog:
             evidence.append('Edition difference: unknown/different language is neutral (+0)' if not same_language else 'Matching language (neutral +0)')
             if authors(author) == authors(source.get('narrator', '')):
                 evidence.append('Possible self-narration: full author set independently corroborated')
-            high = linked and score >= base['threshold']
+            # Automatic confirmation needs an exact work title, or a clean one-sided
+            # source subtitle with no conflicting catalog title in the same results.
+            title_ok = points == 40 or not conflict
+            high = linked and score >= base['threshold'] and title_ok
             candidate = {'title': c['title'], 'author': c['author'], 'isbn': code, 'reference': c['reference']}
             return result | {'candidate': candidate, 'score': score, 'evidence': evidence,
                              'goodreads_isbn_url': 'https://www.goodreads.com/book/isbn/' + code,
                              'high_confidence': high, 'reason': f'Score {score}/100; auto threshold 90 with linked ISBN evidence. ' + '; '.join(evidence) +
-                             ('. ' if high else '. Edition evidence insufficient; review required. ') + 'Goodreads import acceptance is unverified.'}
+                             ('. ' if high else ('. ' + conflict + ' ' if conflict and not title_ok else '. Edition evidence insufficient; review required. ')) +
+                             'Goodreads import acceptance is unverified.'}
         return base | {'provider_error': any('unavailable' in e or 'five seconds' in e for e in errors),
                        'reason': '; '.join(errors) or 'No exact catalog work with a valid ISBN found; review required.'}
