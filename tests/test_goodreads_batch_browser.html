@@ -28,6 +28,7 @@
     w.api = async (path, payload) => {
       if (path === '/api/goodreads') return {books, batches: [], excluded: 3000, match_job: structuredClone(job)};
       if (path === '/api/goodreads/match-batch') {job ||= {id: 'synthetic-job', items: books.slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
+      if (path === '/api/goodreads/retry-provider') {job = {id: 'synthetic-retry', items: books.filter(b => b.retry_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
       if (path === '/api/goodreads/resolve') {
         assert(payload.book_ids.length === 1, 'exactly one ABS ID per request');
         const entry = job.items.find(i => i.id === payload.book_ids[0]);
@@ -63,7 +64,18 @@
   assert(calls.every((c, i) => !i || c.clock - calls[i-1].clock >= 5000), 'provider pacing respected');
   assert(/25 \/ 25 processed · 7 ready · 6 review · 6 skipped · 6 provider errors/.test(w.$('#gr-match-progress').textContent), 'all outcome counts visible');
   assert(!w.$('#gr-books').inert && !w.$('#gr-match-eligible').disabled, 'controls restored');
-  document.querySelector('#result').textContent = 'PASS: progress, 5-second rate, 25 cap, pause (waiting/in-flight), page-close resume, partial decisions and counts.';
+  books[0].provider_error = true; books[0].retry_eligible = true;
+  books[0].reason = 'Google Books [daily_quota]: Daily quota exceeded (HTTP 429).';
+  await mount();
+  const card = w.$('#gr-books').firstElementChild;
+  assert(card.textContent.includes('Lookup could not run; export stays blocked.') && !card.querySelector('p').textContent.includes('Review required'), 'provider block is not review');
+  assert(card.querySelector('input[type=checkbox]').disabled, 'blocked export remains disabled');
+  const retry = [...card.querySelectorAll('button')].find(b => b.textContent === 'Retry provider-blocked books (up to 25)');
+  assert(retry, 'deliberate retry control offered');
+  retry.click(); await tick(); await advance(); await tick();
+  assert(calls.length === 26 && calls[25].id === books[0].id, 'retry only the provider-blocked book');
+  assert(!w.$('#gr-books').inert, 'retry UI restored');
+  document.querySelector('#result').textContent = 'PASS: progress, 5-second rate, 25 cap, pause (waiting/in-flight), page-close resume, partial decisions and counts, honest blocked cards and explicit provider retry.';
   document.title = 'PASS matching browser tests';
 })().catch(error => {document.querySelector('#result').textContent = error.stack; document.title = 'FAIL matching browser tests';});
 </script>

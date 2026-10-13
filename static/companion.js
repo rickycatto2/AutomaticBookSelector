@@ -7,14 +7,14 @@ function grMatchProgress(note = '') {
   $('#gr-match-progress').textContent = `${items.length - count('queued')} / ${items.length} processed · ${count('ready')} ready · ${count('review')} review · ${count('skipped')} skipped · ${count('provider_error') + count('pending')} provider errors / interrupted.${note ? ' ' + note : ''}`;
   $('#gr-match-eligible').textContent = count('queued') ? 'Match eligible books (resume)' : 'Match eligible books';
 }
-async function matchEligibleBooks() {
+async function matchEligibleBooks(retryProvider = false) {
   if (grBatchRunning) return;
   if (grDirty || grAutoBusy) {message(grDirty ? 'Save or reload unsaved edits before matching.' : 'Wait for the current automatic check to finish.', true); return;}
   grBatchRunning = true; grBatchCancelled = false;
   $('#gr-match-eligible').disabled = true; $('#gr-match-cancel').hidden = false;
   $('#gr-books').inert = true; $('#gr-reload').disabled = true;
   try {
-    const response = await api('/api/goodreads/match-batch', {}); grMatchJob = response.job;
+    const response = await api(retryProvider === true ? '/api/goodreads/retry-provider' : '/api/goodreads/match-batch', {}); grMatchJob = response.job;
     if (!grMatchJob) {grMatchProgress('No eligible undecided books. Review existing suggestions per book.'); return;}
     // The server owns the bounded durable queue; never iterate the Goodreads seed.
     for (const item of grMatchJob.items.filter(i => i.state === 'queued').slice(0, 25)) {
@@ -83,7 +83,11 @@ async function loadGoodreads(automatic = true) {
     const card = el('article', 'paper gr-book'), heading = el('div', 'gr-heading'), checkLabel = el('label', 'check'), check = el('input'); check.type = 'checkbox'; check.disabled = !book.ready; check.checked = grSelected.has(book.id); check.setAttribute('aria-label', 'Export ' + book.title);
     check.addEventListener('change', () => {check.checked ? grSelected.add(book.id) : grSelected.delete(book.id); grCount();});
     checkLabel.append(check, el('span', '', book.original_title)); heading.append(checkLabel);
-    const status = el('p', 'muted', (book.ready ? 'Ready to export. ' : 'Review required. ') + book.provenance + ': ' + book.reason); card.append(heading, el('p', 'muted', book.original_author), status);
+    const status = el('p', 'muted', (book.ready ? 'Ready to export. ' : book.provider_error ? 'Lookup could not run; export stays blocked. ' : 'Review required. ') + book.provenance + ': ' + book.reason); card.append(heading, el('p', 'muted', book.original_author), status);
+    if (book.retry_eligible) {
+      const retry = el('button', 'secondary', 'Retry provider-blocked books (up to 25)'); retry.type = 'button';
+      retry.addEventListener('click', () => matchEligibleBooks(true)); card.append(retry);
+    }
     if (book.evidence?.length) card.append(el('p', 'muted', `Evidence score ${book.score}/100 · auto threshold ${book.threshold} plus linked ISBN identity. Edition/language differences are allowed; Goodreads acceptance remains unverified.`));
     const lookupError = el('p', 'error-note'); lookupError.hidden = true; lookupError.setAttribute('role', 'alert'); card.append(lookupError);
     const lookupAction = (button, fn) => action(button, async () => {

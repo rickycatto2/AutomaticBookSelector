@@ -1,15 +1,31 @@
-"""Anonymous, bounded public bibliographic suggestions. Never Goodreads acceptance proof."""
+"""Bounded public bibliographic suggestions. Never Goodreads acceptance proof."""
+import datetime as dt
+import hashlib
 import json
+import os
 import re
 import threading
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 
 from core import AppError, NoRedirect, normalize
 
 ENDPOINTS = {'Google Books': 'https://www.googleapis.com/books/v1/volumes',
              'Open Library': 'https://openlibrary.org/search.json'}
+
+
+class ProviderFailure(AppError):
+    """Only controlled metadata crosses the provider boundary."""
+    def __init__(self, provider, status, message):
+        self.failure = {'provider': provider, 'status': status, 'message': message}
+        super().__init__(f'{provider} [{status}]: {message}')
+
+
+def retryable_provider_result(result):
+    return bool(result.get('provider_error') and not result.get('candidate') and not result.get('candidates')
+                and any(f.get('status') in ('daily_quota', 'transport') for f in result.get('provider_failures', [])))
 
 
 # Explicit series position markers. They identify a different work, not an edition.
@@ -75,23 +91,41 @@ class Catalog:
         self.lock = threading.Lock()
         self.last = {}
         self.cache = {}
+        self.cooldowns = {}
+        self.config = {}
 
     def request(self, provider, params):
         # Endpoint cannot be supplied by a browser, provider result, or catalogue metadata.
         if provider not in ENDPOINTS:
             raise AppError('Unsupported catalog endpoint.')
-        url = ENDPOINTS[provider] + '?' + urllib.parse.urlencode(params)
+        params = dict(params)
+        key = os.environ.get('GOOGLE_BOOKS_API_KEY', '') if provider == 'Google Books' else ''
+        if key:
+            params['key'] = key
+        else:
+            params.pop('key', None)
+        config = hashlib.sha256(key.encode()).digest()
+        # Cache identity never retains a credential-bearing URL.
+        cache_key = (provider, config, urllib.parse.urlencode({k: v for k, v in params.items() if k != 'key'}))
         with self.lock:
             stamp = time.monotonic()
-            cached = self.cache.get(url)
+            if self.config.get(provider) != config:
+                self.config[provider] = config
+                self.cooldowns.pop(provider, None)
+            cooldown = self.cooldowns.get(provider)
+            if cooldown and time.time() < cooldown[0]:
+                raise ProviderFailure(provider, cooldown[1], cooldown[2])
+            self.cooldowns.pop(provider, None)
+            cached = self.cache.get(cache_key)
             if cached and stamp - cached[0] < 86400:
                 return cached[1]
             if stamp - self.last.get(provider, -100) < 5:
-                raise AppError('Please wait five seconds between uncached searches for this provider.')
+                raise ProviderFailure(provider, 'throttle', 'Please wait five seconds between uncached searches for this provider.')
             self.last[provider] = stamp
-            req = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': 'AutomaticBookSelector/1.0'})
             try:
-                # Disable environmental proxies; no cookies, API key, credentials or redirects.
+                url = ENDPOINTS[provider] + '?' + urllib.parse.urlencode(params)
+                req = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': 'AutomaticBookSelector/1.0'})
+                # Disable environmental proxies; no cookies or redirects.
                 with urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()).open(req, timeout=10) as response:
                     raw = response.read(1_000_001)
                 if len(raw) > 1_000_000:
@@ -99,11 +133,34 @@ class Catalog:
                 data = json.loads(raw)
                 if not isinstance(data, dict):
                     raise ValueError('shape')
+                # Defend against a provider reflecting the credential into metadata.
+                if key:
+                    def redact(value):
+                        if isinstance(value, str):
+                            return value.replace(key, '[redacted]')
+                        if isinstance(value, list):
+                            return [redact(v) for v in value]
+                        if isinstance(value, dict):
+                            return {redact(k): redact(v) for k, v in value.items()}
+                        return value
+                    data = redact(data)
+            except urllib.error.HTTPError as exc:
+                status = 'daily_quota' if exc.code == 429 else 'http_' + str(exc.code)
+                message = 'Daily quota exceeded (HTTP 429); lookup could not run.' if exc.code == 429 else 'Provider returned HTTP ' + str(exc.code) + '; lookup could not run.'
+                if exc.code == 429:
+                    tomorrow = dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=1)
+                    self.cooldowns[provider] = (dt.datetime.combine(tomorrow, dt.time(), dt.timezone.utc).timestamp(), status, message)
+                raise ProviderFailure(provider, status, message) from None
+            except (ValueError, TypeError, UnicodeError):
+                raise ProviderFailure(provider, 'invalid_response', 'Invalid or oversized catalog response; lookup could not run.') from None
             except Exception:
-                raise AppError('Public catalog unavailable or response invalid; review manually.') from None
+                message = 'Transport failure or timeout; lookup could not run.'
+                self.cooldowns[provider] = (time.time() + 60, 'transport', message)
+                raise ProviderFailure(provider, 'transport', message) from None
+            self.cooldowns.pop(provider, None)
             if len(self.cache) >= 128:
                 self.cache.pop(next(iter(self.cache)))
-            self.cache[url] = (stamp, data)
+            self.cache[cache_key] = (stamp, data)
             return data
 
     def search(self, provider, title, author):
@@ -136,12 +193,19 @@ class Catalog:
             return base | {'reason': 'Missing work or full author; manual review required.'}
         if re.search(r'\b(?:translator|narrator|translated|narrated)\b', author, re.I):
             return base | {'reason': 'Contributor roles are uncertain; correct/review authors without silently dropping names.'}
-        errors = []
+        errors, failures = [], []
+        genuine_outcome = False
         for provider in ENDPOINTS:
             try:
                 candidates, truncated = self.search(provider, title, author)
-            except (AppError, ValueError, TypeError, AttributeError) as exc:
+            except ProviderFailure as exc:
+                failures.append(exc.failure)
                 errors.append(str(exc))
+                continue
+            except (AppError, ValueError, TypeError, AttributeError):
+                failure = ProviderFailure(provider, 'invalid_response', 'Invalid catalog response; lookup could not run.')
+                failures.append(failure.failure)
+                errors.append(str(failure))
                 continue
             relevant, conflict = [], ''
             for c in candidates:
@@ -151,9 +215,11 @@ class Catalog:
                 elif why != 'Work title not established' and not conflict:
                     conflict = why
             if conflict:
+                genuine_outcome = True
                 errors.append(provider + ': ' + conflict)
             if not relevant:
                 continue
+            genuine_outcome = True
             result = base | {'provenance': provider, 'candidates': relevant}
             if any(not isinstance(v, str) or not v.strip() or len(v) > 1000 or v.lstrip()[0] in '=+-@'
                    for c in relevant for v in (c['title'], c['author'])):
@@ -207,5 +273,5 @@ class Catalog:
                              'high_confidence': high, 'reason': f'Score {score}/100; auto threshold 90 with linked ISBN evidence. ' + '; '.join(evidence) +
                              ('. ' if high else ('. ' + conflict + ' ' if conflict and not title_ok else '. Edition evidence insufficient; review required. ')) +
                              'Goodreads import acceptance is unverified.'}
-        return base | {'provider_error': any('unavailable' in e or 'five seconds' in e for e in errors),
-                       'reason': '; '.join(errors) or 'No exact catalog work with a valid ISBN found; review required.'}
+        return base | {'provider_error': bool(failures) and not genuine_outcome, 'provider_failures': failures,
+                        'reason': '; '.join(errors) or 'No exact catalog work with a valid ISBN found; review required.'}

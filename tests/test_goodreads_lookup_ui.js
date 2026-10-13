@@ -85,6 +85,14 @@ async function main() {
   isbnInput.value = '034541005X'; formInput(); // ISBN-10 with X check digit
   assert.equal(isbnLink.hidden, false);
   assert.equal(isbnLink.href, 'https://www.goodreads.com/book/isbn/034541005X');
+  automatic = false; book.provider_error = true; book.retry_eligible = true;
+  book.reason = 'Google Books [daily_quota]: Daily quota exceeded (HTTP 429).';
+  await context.loadGoodreads(false);
+  card = $('#gr-books').children[0];
+  const status = card.all().find(n => n.tag === 'p' && n.textContent.includes('daily_quota'));
+  assert.match(status.textContent, /Lookup could not run; export stays blocked/);
+  assert.doesNotMatch(status.textContent, /Review required/);
+  assert.ok(card.all().find(n => n.textContent === 'Retry provider-blocked books (up to 25)'));
   console.log('Goodreads UI synthetic checks passed');
 }
 main().catch(error => {console.error(error); process.exitCode = 1;});

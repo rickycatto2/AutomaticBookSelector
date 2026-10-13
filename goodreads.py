@@ -15,7 +15,7 @@ from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
 from core import AppError, NoRedirect, identity, normalize, now, isbn as canonical_isbn
-from isbn_catalog import Catalog, authors, work_title
+from isbn_catalog import Catalog, authors, work_title, retryable_provider_result
 
 ZONE = ZoneInfo('America/Chicago')
 HEADERS = ['Title', 'Author', 'ISBN', 'My Rating', 'Date Read', 'Shelves']
@@ -292,6 +292,9 @@ class Goodreads:
             saved['threshold'] = evidence.get('threshold', 90)
             saved['evidence'] = evidence.get('evidence', [])
             saved['match_eligible'] = not bool(match or saved['failure'] or persisted)
+            saved['provider_error'] = bool(persisted and persisted.get('provider_error') and not match and not saved['failure'])
+            saved['provider_failures'] = evidence.get('provider_failures', [])
+            saved['retry_eligible'] = bool(not match and not saved['failure'] and persisted and retryable_provider_result(persisted))
             if persisted and not match:
                 saved['reason'] = persisted.get('reason', 'Previous lookup interrupted; use per-book review.')
                 saved['provenance'] = persisted.get('provenance') or 'Free catalog check'
@@ -331,6 +334,21 @@ class Goodreads:
                            [(job_id, b['id'], b['source_snapshot']) for b in books])
         return {'job': self.match_job(job_id)}
 
+    def retry_provider_books(self):
+        """Explicit bounded retry; retain every durable attempt until claimed again."""
+        with self.store.lock, self.store.db() as db:
+            job = self.match_job()
+            if job and any(i['state'] == 'queued' for i in job['items']):
+                raise AppError('Finish the existing matching batch before creating a provider retry queue.')
+            books = [b for b in self.review()['books'] if b['retry_eligible']][:25]
+            if not books:
+                return {'job': job}
+            job_id = uuid.uuid4().hex
+            db.execute('INSERT INTO gr_match_jobs VALUES (?,?)', (job_id, now()))
+            db.executemany('INSERT INTO gr_match_job_items(job_id,book_id,source_snapshot,result) VALUES (?,?,?,?)',
+                           [(job_id, b['id'], b['source_snapshot'], '{"provider_retry":true}') for b in books])
+        return {'job': self.match_job(job_id)}
+
     def resolve_batch_item(self, p):
         ids, job_id = p.get('book_ids'), p.get('batch_id')
         if not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str) or not isinstance(job_id, str):
@@ -343,7 +361,8 @@ class Goodreads:
             if row['state'] != 'queued':
                 return {'results': [json.loads(row['result']) | {'id': book_id}], 'job': self.match_job(job_id)}
             book = next((b for b in self.review()['books'] if b['id'] == book_id), None)
-            if not book or not book['match_eligible'] or book['source_snapshot'] != row['source_snapshot']:
+            retry = json.loads(row['result']).get('provider_retry', False)
+            if not book or not (book['retry_eligible'] if retry else book['match_eligible']) or book['source_snapshot'] != row['source_snapshot']:
                 result = {'id': book_id, 'automatic': False, 'reason': 'Skipped: decision, source or export state changed.'}
                 db.execute("UPDATE gr_match_job_items SET state='skipped',result=? WHERE job_id=? AND book_id=?",
                            (json.dumps(result), job_id, book_id))
@@ -355,7 +374,7 @@ class Goodreads:
                           'reason': 'Lookup in flight or interrupted. No automatic retry; use per-book review if needed.'}
                 db.execute("UPDATE gr_match_job_items SET state='pending',result=? WHERE job_id=? AND book_id=?",
                            (json.dumps(result), job_id, book_id))
-                db.execute('INSERT INTO gr_catalog_attempts VALUES (?,?,?)',
+                db.execute('INSERT OR REPLACE INTO gr_catalog_attempts VALUES (?,?,?)',
                            (book_id, row['source_snapshot'], json.dumps(result)))
         if not skipped:
             try:
@@ -462,7 +481,7 @@ class Goodreads:
                 db.execute('INSERT OR REPLACE INTO gr_catalog_attempts VALUES (?,?,?)',
                            (book_id, source_snapshot(source), json.dumps(result)))
             results.append(result | {'id': book_id, 'automatic': automatic,
-                                     'reason': result['reason'] + ('' if automatic else ' Not auto-saved: review candidate, existing decision and completion date.')})
+                                      'reason': result['reason'] + ('' if automatic else ' Export stays blocked; lookup could not run.' if result.get('provider_error') else ' Not auto-saved: review candidate, existing decision and completion date.')})
         return {'results': results}
 
     def auto_resolve(self):
