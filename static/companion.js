@@ -83,7 +83,7 @@ async function loadGoodreads(automatic = true) {
     const card = el('article', 'paper gr-book'), heading = el('div', 'gr-heading'), checkLabel = el('label', 'check'), check = el('input'); check.type = 'checkbox'; check.disabled = !book.ready; check.checked = grSelected.has(book.id); check.setAttribute('aria-label', 'Export ' + book.title);
     check.addEventListener('change', () => {check.checked ? grSelected.add(book.id) : grSelected.delete(book.id); grCount();});
     checkLabel.append(check, el('span', '', book.original_title)); heading.append(checkLabel);
-    const status = el('p', 'muted', (book.ready ? 'Ready to export. ' : book.provider_error ? 'Lookup could not run; export stays blocked. ' : 'Review required. ') + book.provenance + ': ' + book.reason); card.append(heading, el('p', 'muted', book.original_author), status);
+    const status = el('p', 'muted', (book.ready ? 'Ready to export. ' : book.provider_error ? 'Lookup could not run; export stays blocked. ' : 'Review required. ') + book.provenance + ': ' + (book.lookup_status || book.reason)); card.append(heading, el('p', 'muted', book.original_author), status);
     if (book.retry_eligible) {
       const retry = el('button', 'secondary', 'Retry provider-blocked books (up to 25)'); retry.type = 'button';
       retry.addEventListener('click', () => matchEligibleBooks(true)); card.append(retry);

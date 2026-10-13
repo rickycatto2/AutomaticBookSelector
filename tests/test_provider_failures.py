@@ -8,7 +8,7 @@ import urllib.parse
 from unittest.mock import MagicMock, patch
 
 from isbn_catalog import Catalog, ProviderFailure, ENDPOINTS
-from goodreads import source_snapshot
+from goodreads import Goodreads, source_snapshot, LEGACY_CATALOG_BLOCK
 from test_core import item
 import test_isbn_catalog as fixtures
 from test_isbn_catalog import GOOGLE, SOURCE
@@ -155,3 +155,88 @@ class RetryTests(unittest.TestCase):
         self.gr.start_match_batch()
         with self.assertRaises(Exception):
             self.gr.retry_provider_books()
+
+
+class LegacyAttemptTests(unittest.TestCase):
+    setUp = fixtures.ExportAutomationTests.setUp
+    persist = RetryTests.persist
+    blocked = RetryTests.blocked
+    def legacy(self):
+        return {'provider_error': True, 'candidate': None, 'reason': 'Recorded: ' + LEGACY_CATALOG_BLOCK,
+                'evidence': ['original evidence'], 'high_confidence': False}
+
+    def raw_attempts(self):
+        with self.store.db() as db:
+            return [tuple(r) for r in db.execute('SELECT * FROM gr_catalog_attempts ORDER BY book_id,source_snapshot')]
+
+    def test_legacy_upgrade_first_use_preserves_reason_and_second_run(self):
+        original = self.legacy()
+        self.persist('one', original)
+        # Simulate reopening an existing database; migration runs on first use.
+        self.gr = Goodreads(self.store)
+        book = self.gr.review()['books'][0]
+        self.assertTrue(book['retry_eligible'])
+        self.assertTrue(book['provider_error'])
+        self.assertFalse(book['ready'])
+        self.assertEqual(book['reason'], original['reason'])
+        self.assertIn('blocked', book['lookup_status'])
+        upgraded = json.loads(self.raw_attempts()[0][2])
+        self.assertEqual(upgraded.pop('provider_failures')[0]['provider'], 'catalog')
+        self.assertEqual(upgraded, original)
+        before = self.raw_attempts()
+        self.assertEqual(self.gr.migrate_legacy_catalog_attempts(), 0)
+        self.assertEqual(self.raw_attempts(), before)
+
+    def test_conservative_and_byte_unchanged_exclusions(self):
+        cases = [self.blocked(), self.legacy() | {'provider_failures': []},
+                 self.legacy() | {'candidate': {'title': 'One'}},
+                 self.legacy() | {'candidates': [{'title': 'One'}]},
+                 self.legacy() | {'reason': 'Genuine review required'},
+                 self.legacy() | {'provider_error': False},
+                 self.legacy() | {'automatic': True}, self.legacy() | {'high_confidence': True}]
+        with self.store.db() as db:
+            for i, result in enumerate(cases):
+                db.execute('INSERT INTO gr_catalog_attempts VALUES (?,?,?)', ('case-' + str(i), 'snapshot', json.dumps(result, indent=2)))
+        before = self.raw_attempts()
+        self.assertEqual(self.gr.migrate_legacy_catalog_attempts(), 0)
+        self.assertEqual(self.gr.migrate_legacy_catalog_attempts(), 0)
+        self.assertEqual(self.raw_attempts(), before)
+
+    def test_zero_rows_and_other_tables_untouched(self):
+        self.assertEqual(self.gr.migrate_legacy_catalog_attempts(), 0)
+        self.gr.start_match_batch()
+        with self.store.db() as db:
+            db.execute("INSERT INTO gr_exports VALUES ('sentinel','2026-10-01','original csv')")
+            db.execute("INSERT INTO gr_export_items VALUES ('sentinel','other','other','Other','Writer','','exported','')")
+            db.execute("INSERT INTO gr_matches VALUES ('other','Other','Writer','','','',0,NULL,'',0,'original')")
+        tables = ['gr_matches', 'gr_exports', 'gr_export_items', 'gr_match_jobs', 'gr_match_job_items']
+        def snapshot():
+            with self.store.db() as db:
+                return {t: [tuple(r) for r in db.execute('SELECT * FROM ' + t)] for t in tables}
+        before = snapshot()
+        self.persist('one', self.legacy())
+        self.assertEqual(self.gr.migrate_legacy_catalog_attempts(), 1)
+        self.assertEqual(snapshot(), before)
+
+    def test_both_batch_actions_queue_legacy_set_without_provider_calls(self):
+        for i in range(19):
+            book_id = 'legacy-' + str(i)
+            self.abs.items.append(item(book_id, 'Legacy ' + str(i), 'Writer'))
+            self.abs.user['mediaProgress'].append({'libraryItemId': book_id, 'isFinished': True, 'finishedAt': '2026-10-01'})
+        self.store.sync()
+        self.persist('one', {'provider_error': False, 'reason': 'Genuine review'})
+        for i in range(19):
+            self.persist('legacy-' + str(i), self.legacy())
+        with patch.object(self.gr.catalog, 'resolve', side_effect=AssertionError('No provider calls')) as lookup:
+            general = self.gr.start_match_batch()['job']
+            self.assertEqual(len(general['items']), 19)
+            with self.store.db() as db:
+                results = [json.loads(r[0]) for r in db.execute('SELECT result FROM gr_match_job_items WHERE job_id=?', (general['id'],))]
+                self.assertTrue(all(r['provider_retry'] for r in results))
+                # Synthetic terminal states, not a live lookup; retain the queue.
+                db.execute("UPDATE gr_match_job_items SET state='provider_error' WHERE job_id=?", (general['id'],))
+            retry = self.gr.retry_provider_books()['job']
+            self.assertEqual(len(retry['items']), 19)
+            self.assertEqual({i['id'] for i in retry['items']}, {i['id'] for i in general['items']})
+            lookup.assert_not_called()
+        self.assertEqual(len(self.raw_attempts()), 20)

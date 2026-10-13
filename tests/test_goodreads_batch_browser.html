@@ -27,7 +27,7 @@
     w.clearTimeout = timer => {w.timers = w.timers.filter(t => t !== timer);};
     w.api = async (path, payload) => {
       if (path === '/api/goodreads') return {books, batches: [], excluded: 3000, match_job: structuredClone(job)};
-      if (path === '/api/goodreads/match-batch') {job ||= {id: 'synthetic-job', items: books.slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
+      if (path === '/api/goodreads/match-batch') {job ||= {id: 'synthetic-job', items: books.filter(b => b.match_eligible !== false || b.retry_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
       if (path === '/api/goodreads/retry-provider') {job = {id: 'synthetic-retry', items: books.filter(b => b.retry_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
       if (path === '/api/goodreads/resolve') {
         assert(payload.book_ids.length === 1, 'exactly one ABS ID per request');
@@ -74,8 +74,22 @@
   assert(retry, 'deliberate retry control offered');
   retry.click(); await tick(); await advance(); await tick();
   assert(calls.length === 26 && calls[25].id === books[0].id, 'retry only the provider-blocked book');
-  assert(!w.$('#gr-books').inert, 'retry UI restored');
-  document.querySelector('#result').textContent = 'PASS: progress, 5-second rate, 25 cap, pause (waiting/in-flight), page-close resume, partial decisions and counts, honest blocked cards and explicit provider retry.';
+   assert(!w.$('#gr-books').inert, 'retry UI restored');
+   // Migrated API shape: old reason remains as evidence, not the current status.
+   books.forEach((book, i) => Object.assign(book, {match_eligible: false, retry_eligible: i < 19,
+     provider_error: i < 19, reason: 'Public catalog unavailable or response invalid; review manually.',
+     lookup_status: i < 19 ? 'Previous catalog lookup was blocked by a request failure. It can be retried; no match decision was made.' : ''}));
+   job = null; await mount();
+   const legacyCard = w.$('#gr-books').firstElementChild;
+   assert(legacyCard.textContent.includes('It can be retried') && !legacyCard.textContent.includes('review manually.'), 'legacy reason does not mislabel current status');
+   w.$('#gr-match-eligible').click(); await tick();
+   assert(job.items.length === 19 && job.items.every(i => i.state === 'queued'), 'general button queues legacy-blocked set');
+   w.$('#gr-match-cancel').click(); await tick();
+   job = null; await mount();
+   [...w.$('#gr-books').firstElementChild.querySelectorAll('button')].find(b => b.textContent === 'Retry provider-blocked books (up to 25)').click(); await tick();
+   assert(job.items.length === 19 && job.items.every(i => i.state === 'queued'), 'retry button queues legacy-blocked set');
+   w.$('#gr-match-cancel').click(); await tick();
+   document.querySelector('#result').textContent = 'PASS: progress, 5-second rate, 25 cap, pause (waiting/in-flight), page-close resume, partial decisions and counts, honest blocked cards, explicit provider retry, and both buttons queue 19 legacy-blocked books.';
   document.title = 'PASS matching browser tests';
 })().catch(error => {document.querySelector('#result').textContent = error.stack; document.title = 'FAIL matching browser tests';});
 </script>

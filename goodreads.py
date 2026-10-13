@@ -19,6 +19,7 @@ from isbn_catalog import Catalog, authors, work_title, retryable_provider_result
 
 ZONE = ZoneInfo('America/Chicago')
 HEADERS = ['Title', 'Author', 'ISBN', 'My Rating', 'Date Read', 'Shelves']
+LEGACY_CATALOG_BLOCK = 'Public catalog unavailable or response invalid; review manually.'
 
 
 def import_report(text, items):
@@ -238,7 +239,34 @@ class Goodreads:
                 state TEXT NOT NULL DEFAULT 'queued',result TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY(job_id,book_id));''')
 
+    def migrate_legacy_catalog_attempts(self):
+        """Add transport evidence only for the old request-exception marker.
+
+        No provider identity survived that exception, so use a neutral label.
+        Existing structured results and bibliographic decisions are untouched.
+        """
+        upgraded = 0
+        with self.store.lock, self.store.db() as db:
+            for row in db.execute('SELECT * FROM gr_catalog_attempts').fetchall():
+                try:
+                    result = json.loads(row['result'])
+                except (ValueError, TypeError):
+                    continue
+                if (not isinstance(result, dict) or result.get('provider_error') is not True
+                        or 'provider_failures' in result or result.get('candidate') or result.get('candidates')
+                        or result.get('high_confidence') or result.get('automatic')
+                        or not isinstance(result.get('reason'), str)
+                        or LEGACY_CATALOG_BLOCK not in result['reason']):
+                    continue
+                result['provider_failures'] = [{'provider': 'catalog', 'status': 'transport',
+                    'message': 'Legacy catalog request failed; lookup was blocked and can be retried.'}]
+                db.execute('UPDATE gr_catalog_attempts SET result=? WHERE book_id=? AND source_snapshot=?',
+                           (json.dumps(result), row['book_id'], row['source_snapshot']))
+                upgraded += 1
+        return upgraded
+
     def review(self):
+        self.migrate_legacy_catalog_attempts()
         with self.store.db() as db:
             history = [dict(r) for r in db.execute('SELECT * FROM history')]
             read_titles = {work_identity(h) for h in history if h['shelf'] == 'read' or h['date_read'] or h['read_count']}
@@ -295,6 +323,8 @@ class Goodreads:
             saved['provider_error'] = bool(persisted and persisted.get('provider_error') and not match and not saved['failure'])
             saved['provider_failures'] = evidence.get('provider_failures', [])
             saved['retry_eligible'] = bool(not match and not saved['failure'] and persisted and retryable_provider_result(persisted))
+            if saved['retry_eligible'] and LEGACY_CATALOG_BLOCK in persisted.get('reason', ''):
+                saved['lookup_status'] = 'Previous catalog lookup was blocked by a request failure. It can be retried; no match decision was made.'
             if persisted and not match:
                 saved['reason'] = persisted.get('reason', 'Previous lookup interrupted; use per-book review.')
                 saved['provenance'] = persisted.get('provenance') or 'Free catalog check'
@@ -325,13 +355,13 @@ class Goodreads:
             job = self.match_job()
             if job and any(i['state'] == 'queued' for i in job['items']):
                 return {'job': job}
-            books = [b for b in self.review()['books'] if b['match_eligible']][:25]
+            books = [b for b in self.review()['books'] if b['match_eligible'] or b['retry_eligible']][:25]
             if not books:
                 return {'job': job}
             job_id = uuid.uuid4().hex
             db.execute('INSERT INTO gr_match_jobs VALUES (?,?)', (job_id, now()))
-            db.executemany('INSERT INTO gr_match_job_items(job_id,book_id,source_snapshot) VALUES (?,?,?)',
-                           [(job_id, b['id'], b['source_snapshot']) for b in books])
+            db.executemany('INSERT INTO gr_match_job_items(job_id,book_id,source_snapshot,result) VALUES (?,?,?,?)',
+                            [(job_id, b['id'], b['source_snapshot'], json.dumps({'provider_retry': b['retry_eligible']})) for b in books])
         return {'job': self.match_job(job_id)}
 
     def retry_provider_books(self):
