@@ -41,6 +41,35 @@ def parenthetical(value):
     return match.group(1) if match else ''
 
 
+def volume_marker(value):
+    """Trailing volume/part/numbered-series marker; '' when there is none."""
+    tail = parenthetical(value)
+    return normalize(tail) if SERIES_MARK.search(tail) else ''
+
+
+def truncation_review(title, author, relevant, usable):
+    """Truncation alone is not evidence of a wrong work.
+
+    Provider page limits make totalItems > 10 ordinary for popular titles, so
+    a truncated result can still be confirmed automatically when every
+    relevant candidate agrees on one work identity: the exact source work
+    title key, the full source author set, no conflicting subtitle or volume
+    marker, and a checksum-valid ISBN on every candidate. Any disagreement
+    among them, or a candidate without a usable ISBN, keeps the book in
+    review. Returns '' only when that agreement holds.
+    """
+    keys = {work_title(c['title']) for c in relevant}
+    if len(keys) > 1 or keys != {work_title(title)}:
+        return 'Truncated search, but matching candidates do not all agree on one work title; review required.'
+    if {volume_marker(c['title']) for c in relevant} - {volume_marker(title)}:
+        return 'Truncated search, but matching candidates carry conflicting volume or series markers; review required.'
+    if {authors(c['author']) for c in relevant} != {authors(author)}:
+        return 'Truncated search, but matching candidates disagree on the full author set; review required.'
+    if len(usable) != len(relevant):
+        return 'Truncated search, and a matching candidate lacks a checksum-valid ISBN; review required.'
+    return ''
+
+
 def title_evidence(left, right):
     """Points plus reason for a catalog title (left) against the source (right).
 
@@ -84,6 +113,20 @@ def language(value):
     key = normalize(value or '')
     return {'english': 'en', 'eng': 'en', 'en': 'en', 'german': 'de', 'deu': 'de', 'ger': 'de', 'de': 'de',
             'french': 'fr', 'fra': 'fr', 'fre': 'fr', 'fr': 'fr', 'spanish': 'es', 'spa': 'es', 'es': 'es'}.get(key, '')
+
+
+def google_query(title, author):
+    """Plain search words; metadata cannot introduce query syntax.
+
+    Punctuation (including quotes, colons and apostrophes) and controls become
+    word separators. Boolean words are quoted so they stay literal, without
+    imposing phrase adjacency on titles or multi-author lists.
+    This is retrieval only: identity checks use the unchanged
+    source title/author, never these stripped query words.
+    """
+    words = re.findall(r'[^\W_]+', title + ' ' + author)
+    return ' '.join('"' + word + '"' if word.upper() in {'AND', 'OR', 'NOT'} else word
+                    for word in words)
 
 
 class Catalog:
@@ -165,7 +208,7 @@ class Catalog:
 
     def search(self, provider, title, author):
         if provider == 'Google Books':
-            data = self.request(provider, {'q': 'intitle:"' + title + '" inauthor:"' + author + '"', 'maxResults': 10, 'printType': 'books'})
+            data = self.request(provider, {'q': google_query(title, author), 'maxResults': 10, 'printType': 'books'})
             candidates = []
             for item in (data.get('items') or [])[:10]:
                 v = item.get('volumeInfo') or {}
@@ -224,8 +267,6 @@ class Catalog:
             if any(not isinstance(v, str) or not v.strip() or len(v) > 1000 or v.lstrip()[0] in '=+-@'
                    for c in relevant for v in (c['title'], c['author'])):
                 return result | {'reason': 'Unsafe catalog title/author fields; manual review required.'}
-            if truncated:
-                return result | {'reason': 'Search is truncated; multiple works may exist. Review required.'}
             if any(authors(c['author']) != authors(author) for c in relevant):
                 return result | {'reason': 'Same-title author mismatch or ambiguous works; review required.'}
             subtitles = {work_title(c['title']) for c in relevant if ':' in c['title']}
@@ -237,6 +278,11 @@ class Catalog:
             if provider == 'Open Library' and (len({c['reference'] for c in relevant}) > 1
                                              or not all(re.fullmatch(r'/works/[A-Za-z0-9]+', c['reference']) for c in relevant)):
                 return result | {'reason': 'Multiple distinct catalog works; review required.'}
+            # A truncated page is review only when its candidates disagree; a
+            # unanimous exact work identity is relaxed, never a wrong work.
+            blocked = truncation_review(title, author, relevant, usable) if truncated else ''
+            if blocked:
+                return result | {'reason': blocked}
             if not usable:
                 errors.append(provider + ': no valid ISBN')
                 continue
@@ -263,6 +309,8 @@ class Catalog:
             evidence.append('Edition difference: unknown/different language is neutral (+0)' if not same_language else 'Matching language (neutral +0)')
             if authors(author) == authors(source.get('narrator', '')):
                 evidence.append('Possible self-narration: full author set independently corroborated')
+            if truncated:
+                evidence.append('Truncated search, but every matching candidate agrees on the same work title and full author set (neutral +0)')
             # Automatic confirmation needs an exact work title, or a clean one-sided
             # source subtitle with no conflicting catalog title in the same results.
             title_ok = points == 40 or not conflict

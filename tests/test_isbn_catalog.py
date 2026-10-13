@@ -5,6 +5,7 @@ import json
 import pathlib
 import tempfile
 import unittest
+import urllib.parse
 from unittest.mock import patch, MagicMock
 
 from core import AppError, Store, NoRedirect
@@ -22,12 +23,195 @@ OPEN = {'numFound': 1, 'docs': [{'key': '/works/SYNTHETIC', 'title': 'One',
 SOURCE = {'title': 'One', 'author': 'Writer', 'language': 'English', 'narrator': 'Voice'}
 
 
+# Real Google response shape, synthetic bibliographic identity/ISBN only.
+GOOGLE_BROAD = {'kind': 'books#volumes', 'totalItems': 2, 'items': [
+    {'kind': 'books#volume', 'id': 'synthetic-exact', 'volumeInfo': {
+        'title': 'The Synthetic Long Work', 'authors': ['Writer', 'Coauthor'],
+        'publisher': 'Synthetic Press', 'publishedDate': '2026', 'language': 'en',
+        'printType': 'BOOK', 'industryIdentifiers': [
+            {'type': 'ISBN_13', 'identifier': '9780306406157'},
+            {'type': 'ISBN_10', 'identifier': '0306406152'}]},
+     'saleInfo': {'isEbook': False}, 'accessInfo': {'viewability': 'NO_PAGES'}},
+    {'kind': 'books#volume', 'id': 'synthetic-unrelated', 'volumeInfo': {
+        'title': 'A Different Work', 'authors': ['Writer', 'Coauthor'],
+        'industryIdentifiers': [{'type': 'ISBN_13', 'identifier': '9798217058785'}]}}
+]}
+BROAD_SOURCE = SOURCE | {'title': 'The Synthetic Long Work', 'author': 'Writer; Coauthor'}
+
+
 class CatalogTests(unittest.TestCase):
     def resolve(self, google=GOOGLE, library=OPEN, source=SOURCE):
         catalog = Catalog()
         with patch.object(catalog, 'request', side_effect=[google, library]) as request:
             result = catalog.resolve(source)
         return result, request
+
+    def test_google_plain_query_optional_author_and_unchanged_caps(self):
+        catalog = Catalog()
+        for author, expected in (('Andy Weir', 'Project Hail Mary Andy Weir'),
+                                 ('', 'Project Hail Mary')):
+            with self.subTest(author=author), patch.object(catalog, 'request', return_value={}) as request:
+                catalog.search('Google Books', 'Project Hail Mary', author)
+                request.assert_called_once_with('Google Books', {
+                    'q': expected, 'maxResults': 10, 'printType': 'books'})
+                self.assertNotRegex(expected, r'intitle:|inauthor:')
+
+    def test_google_hostile_metadata_is_plain_words_not_query_syntax(self):
+        title = 'A "Title": intitle:"Other"\x00\nOR -isbn:123 &key=not-a-key'
+        author = "O'Connor; inauthor:\"Attacker\"\r\tD’Arcy"
+        catalog = Catalog()
+        with patch.object(catalog, 'request', return_value={}) as request:
+            catalog.search('Google Books', title, author)
+        params = request.call_args.args[1]
+        self.assertEqual(params['q'], 'A Title intitle Other "OR" isbn 123 key "not" a key O Connor inauthor Attacker D Arcy')
+        self.assertRegex(params['q'], r'^(?:\w+|"\w+")(?: (?:\w+|"\w+"))*$')
+        self.assertNotRegex(params['q'], r'[\x00-\x1f\x7f:\'&=+-]')
+        self.assertNotIn('intitle:', params['q'])
+        self.assertNotIn('inauthor:', params['q'])
+        encoded = urllib.parse.parse_qs(urllib.parse.urlencode(params))
+        self.assertEqual(set(encoded), {'q', 'maxResults', 'printType'})
+        self.assertEqual(encoded['q'], [params['q']])
+        with patch.object(catalog, 'request', return_value={}) as request:
+            catalog.search('Google Books', 'Été: 東京', 'José García')
+        self.assertEqual(request.call_args.args[1]['q'], 'Été 東京 José García')
+
+    def test_open_library_uses_literal_title_author_parameters_unchanged(self):
+        title, author = 'A "Title": Volume 2\n', "O'Connor: inauthor:Other"
+        catalog = Catalog()
+        with patch.object(catalog, 'request', return_value={'docs': []}) as request:
+            self.assertEqual(catalog.search('Open Library', title, author), ([], False))
+        request.assert_called_once_with('Open Library', {
+            'title': title, 'author': author, 'limit': 10,
+            'fields': 'key,title,author_name,isbn,language,editions,editions.key,editions.title,editions.author_name,editions.isbn'})
+        params = urllib.parse.parse_qs(urllib.parse.urlencode(request.call_args.args[1]))
+        self.assertEqual(params['title'], [title])
+        self.assertEqual(params['author'], [author])
+        self.assertNotIn('q', params)
+
+    def test_broad_google_payload_requires_exact_work_and_full_author_set(self):
+        result, request = self.resolve(google=GOOGLE_BROAD, library={'docs': []}, source=BROAD_SOURCE)
+        self.assertTrue(result['high_confidence'])
+        self.assertEqual(result['candidate']['reference'], 'synthetic-exact')
+        self.assertEqual(request.call_args.args[1]['q'], 'The Synthetic Long Work Writer Coauthor')
+        for change, reason in (({'title': 'The Synthetic Long Works'}, 'No exact catalog work'),
+                               ({'authors': ['Writer']}, 'author mismatch'),
+                               ({'authors': ['Writer', 'Coauthor', 'Voice']}, 'author mismatch'),
+                               ({'authors': ['Writer', 'Voice']}, 'author mismatch')):
+            google = copy.deepcopy(GOOGLE_BROAD)
+            google['items'][0]['volumeInfo'].update(change)
+            with self.subTest(change=change):
+                result, _ = self.resolve(google=google, library={'docs': []}, source=BROAD_SOURCE)
+                self.assertFalse(result['high_confidence'])
+                self.assertIsNone(result['candidate'])
+                self.assertIn(reason, result['reason'])
+
+    def test_broad_google_payload_subtitle_series_volume_vetoes(self):
+        for change in ({'subtitle': 'Volume 2'}, {'subtitle': 'Book 3'},
+                       {'subtitle': 'Part 4'}, {'subtitle': 'A Novel'},
+                       {'title': 'The Synthetic Long Work (Series #1)'},
+                       {'title': 'The Synthetic Long Work (Volume 2)'}):
+            google = copy.deepcopy(GOOGLE_BROAD)
+            google['items'][0]['volumeInfo'].update(change)
+            with self.subTest(change=change):
+                result, _ = self.resolve(google=google, library={'docs': []}, source=BROAD_SOURCE)
+                self.assertFalse(result['high_confidence'])
+                self.assertIsNone(result['candidate'])
+                self.assertIn('review required', result['reason'])
+        google = copy.deepcopy(GOOGLE_BROAD)
+        google['items'][0]['volumeInfo']['subtitle'] = 'Different Subtitle'
+        result, _ = self.resolve(google=google, library={'docs': []},
+                                 source=BROAD_SOURCE | {'title': 'The Synthetic Long Work: Source Subtitle'})
+        self.assertFalse(result['high_confidence'])
+        self.assertIn('Conflicting subtitles', result['reason'])
+
+    def test_popular_title_control_truncation_keeps_record_cap_and_auto_confirms(self):
+        # Control shape seen for popular titles: totalItems 343, one page of 10,
+        # exact work title plus full author set present. Truncation alone is
+        # not a wrong-work signal once every matching candidate agrees.
+        google = copy.deepcopy(GOOGLE_BROAD)
+        google['totalItems'] = 343
+        google['items'] *= 6
+        catalog = Catalog()
+        with patch.object(catalog, 'request', return_value=google):
+            candidates, truncated = catalog.search('Google Books', BROAD_SOURCE['title'], BROAD_SOURCE['author'])
+        self.assertEqual(len(candidates), 10)
+        self.assertTrue(truncated)
+        result, _ = self.resolve(google=google, library={'docs': []}, source=BROAD_SOURCE)
+        self.assertTrue(result['high_confidence'])
+        self.assertEqual(result['candidate']['reference'], 'synthetic-exact')
+        self.assertIn('Truncated search, but every matching candidate agrees', result['reason'])
+        self.assertIn('unverified', result['reason'])
+
+    def test_truncated_search_single_agreeing_work_identity_still_auto_confirms(self):
+        google = copy.deepcopy(GOOGLE_BROAD)
+        google['totalItems'] = 40
+        result, _ = self.resolve(google=google, library={'docs': []}, source=BROAD_SOURCE)
+        self.assertTrue(result['high_confidence'])
+        self.assertEqual(result['candidate']['reference'], 'synthetic-exact')
+        self.assertIn('Truncated search, but every matching candidate agrees', result['reason'])
+
+    def test_truncated_search_author_conflicting_candidate_forces_review(self):
+        google = copy.deepcopy(GOOGLE_BROAD)
+        google['totalItems'] = 343
+        other = copy.deepcopy(google['items'][0])
+        other['id'] = 'synthetic-other-author'
+        other['volumeInfo']['authors'] = ['Writer', 'Someone Else']
+        google['items'].append(other)
+        result, request = self.resolve(google=google, library={'docs': []}, source=BROAD_SOURCE)
+        self.assertFalse(result['high_confidence'])
+        self.assertIsNone(result['candidate'])
+        self.assertIn('author mismatch', result['reason'])
+        self.assertEqual(request.call_count, 1)  # no fallback laundering the conflict
+
+    def test_truncated_search_conflicting_subtitles_force_review(self):
+        source = BROAD_SOURCE | {'title': 'The Synthetic Long Work: Source Subtitle'}
+        google = copy.deepcopy(GOOGLE_BROAD)
+        google['totalItems'] = 343
+        google['items'][0]['volumeInfo']['title'] = 'The Synthetic Long Work: Source Subtitle'
+        bare = copy.deepcopy(google['items'][0])
+        bare['id'] = 'synthetic-bare'
+        bare['volumeInfo']['title'] = 'The Synthetic Long Work'
+        google['items'].append(bare)
+        result, request = self.resolve(google=google, library={'docs': []}, source=source)
+        self.assertFalse(result['high_confidence'])
+        self.assertIsNone(result['candidate'])
+        self.assertIn('do not all agree on one work title', result['reason'])
+        self.assertEqual(request.call_count, 1)
+
+    def test_truncated_search_candidate_without_usable_isbn_forces_review(self):
+        google = copy.deepcopy(GOOGLE_BROAD)
+        google['totalItems'] = 343
+        noisbn = copy.deepcopy(google['items'][0])
+        noisbn['id'] = 'synthetic-no-isbn'
+        noisbn['volumeInfo']['industryIdentifiers'] = []
+        google['items'].append(noisbn)
+        result, request = self.resolve(google=google, library={'docs': []}, source=BROAD_SOURCE)
+        self.assertFalse(result['high_confidence'])
+        self.assertIsNone(result['candidate'])
+        self.assertIn('checksum-valid ISBN', result['reason'])
+        self.assertEqual(request.call_count, 1)
+        # Not truncated, the same page keeps the existing non-truncated behaviour.
+        google['totalItems'] = 6
+        result, _ = self.resolve(google=google, library={'docs': []}, source=BROAD_SOURCE)
+        self.assertTrue(result['high_confidence'])
+        self.assertEqual(result['candidate']['reference'], 'synthetic-exact')
+
+    def test_truncation_review_helper_work_identity_conditions(self):
+        from isbn_catalog import truncation_review
+        exact = {'title': 'The Synthetic Long Work', 'author': 'Writer; Coauthor'}
+        usable = [['9780306406157'], ['9780306406157']]
+        self.assertEqual(truncation_review(BROAD_SOURCE['title'], BROAD_SOURCE['author'],
+                                           [exact, exact | {'title': 'The Synthetic Long Work'}], usable), '')
+        for relevant, fragment in (
+                ([exact, exact | {'title': 'The Synthetic Long Works'}], 'one work title'),
+                ([exact | {'title': 'The Synthetic Long Works: A Subtitle'}], 'one work title'),
+                ([exact, exact | {'author': 'Writer'}], 'full author set'),
+                ([exact | {'title': 'The Synthetic Long Work (Unabridged: Volume 2)'}], 'volume or series markers')):
+            with self.subTest(relevant=relevant):
+                reason = truncation_review(BROAD_SOURCE['title'], BROAD_SOURCE['author'], relevant, usable[:len(relevant)])
+                self.assertIn(fragment, reason)
+        self.assertIn('checksum-valid ISBN', truncation_review(BROAD_SOURCE['title'], BROAD_SOURCE['author'],
+                                                               [exact, exact | {'author': 'Coauthor; Writer'}], usable[:1]))
 
     def test_exact_full_author_language_isbn(self):
         result, request = self.resolve()
