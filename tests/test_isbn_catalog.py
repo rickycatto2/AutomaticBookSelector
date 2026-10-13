@@ -41,7 +41,7 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(result['high_confidence'])
 
     def test_author_mismatch_ambiguous_title_and_conflicting_work_block(self):
-        for change in ({'authors': ['Voice']}, {'authors': ['Writer', 'Coauthor']}, {'language': 'de'}, {'language': ''}):
+        for change in ({'authors': ['Voice']}, {'authors': ['Writer', 'Coauthor']}):
             google = copy.deepcopy(GOOGLE)
             google['items'][0]['volumeInfo'].update(change)
             result, request = self.resolve(google=google)
@@ -61,7 +61,7 @@ class CatalogTests(unittest.TestCase):
         other['id'] = 'different-volume'
         other['volumeInfo']['industryIdentifiers'][0]['identifier'] = '9798217058785'
         google['items'].append(other)
-        self.assertFalse(self.resolve(google=google)[0]['high_confidence'])
+        self.assertTrue(self.resolve(google=google)[0]['high_confidence'])
         other['volumeInfo']['industryIdentifiers'][0]['identifier'] = '0306406152'
         self.assertTrue(self.resolve(google=google)[0]['high_confidence'])
 
@@ -81,13 +81,55 @@ class CatalogTests(unittest.TestCase):
         self.assertFalse(self.resolve(google={'items': []}, library=library)[0]['high_confidence'])
         self.assertEqual(valid_isbn('0000000000000'), '')
 
-    def test_unknown_language_and_contributor_roles_never_silently_fixed(self):
-        for source in (SOURCE | {'language': ''}, SOURCE | {'author': 'Voice'},
-                       SOURCE | {'author': 'Writer, Translator - translator'}, SOURCE | {'author': ''},
+    def test_unsafe_source_and_explicit_contributor_roles_never_silently_fixed(self):
+        for source in (SOURCE | {'author': 'Writer, Translator - translator'}, SOURCE | {'author': ''},
                        SOURCE | {'title': '=formula'}, SOURCE | {'author': 'x' * 1001}):
             result, request = self.resolve(source=source)
             self.assertFalse(result['high_confidence'])
             request.assert_not_called()
+
+    def test_language_neutral_and_self_narration_requires_corroboration(self):
+        for lang in ('', 'de', 'en'):
+            google = copy.deepcopy(GOOGLE)
+            google['items'][0]['volumeInfo']['language'] = lang
+            result, _ = self.resolve(google=google, source=SOURCE | {'language': ''})
+            self.assertTrue(result['high_confidence'])
+            self.assertEqual(result['score'], 100)
+        self.assertTrue(self.resolve(source=SOURCE | {'language': 'German'})[0]['high_confidence'])
+        result, _ = self.resolve(source=SOURCE | {'narrator': 'Writer'})
+        self.assertTrue(result['high_confidence'])
+        self.assertIn('self-narration', result['reason'])
+        result, request = self.resolve(source=SOURCE | {'author': 'Voice'})
+        self.assertFalse(result['high_confidence'])
+        self.assertEqual(request.call_count, 1)
+
+    def test_multiple_editions_deterministic_print_preference(self):
+        google = copy.deepcopy(GOOGLE)
+        other = copy.deepcopy(google['items'][0])
+        other['id'] = 'print'
+        other['volumeInfo'].update(publisher='Synthetic publisher', language='de',
+                                  industryIdentifiers=[{'identifier': '9798217058785'}])
+        google['items'].append(other)
+        result, _ = self.resolve(google=google)
+        self.assertTrue(result['high_confidence'])
+        self.assertEqual(result['candidate']['reference'], 'print')
+        google['items'].reverse()
+        self.assertEqual(self.resolve(google=google)[0]['candidate'], result['candidate'])
+
+    def test_open_library_linked_edition_only_and_conservative_subtitles(self):
+        library = copy.deepcopy(OPEN)
+        library['docs'][0]['editions'] = {'docs': [{'key': '/books/SYNTHETIC', 'title': 'One',
+                                                  'author_name': ['Writer'], 'isbn': ['0306406152']}]}
+        self.assertTrue(self.resolve(google={'items': []}, library=library)[0]['high_confidence'])
+        library['docs'][0]['editions']['docs'][0]['author_name'] = ['Voice']
+        self.assertFalse(self.resolve(google={'items': []}, library=library)[0]['high_confidence'])
+        google = copy.deepcopy(GOOGLE)
+        google['items'][0]['volumeInfo']['title'] = 'The Synthetic Long Work: A Subtitle'
+        result, _ = self.resolve(google=google, source=SOURCE | {'title': 'The Synthetic Long Work'})
+        self.assertTrue(result['high_confidence'])
+        self.assertEqual(result['score'], 95)
+        self.assertFalse(self.resolve(google=google, library={'docs': []},
+                         source=SOURCE | {'title': 'The Synthetic Long Work: Different Subtitle'})[0]['high_confidence'])
 
     def test_bounded_transport_cache_rate_limit_and_ssrf(self):
         response = MagicMock()
@@ -194,6 +236,37 @@ class ExportAutomationTests(unittest.TestCase):
             db.execute("INSERT INTO history VALUES ('123','One','Writer','',0,'read','','','',1,'one','writer')")
         self.assertEqual([b['id'] for b in self.gr.review()['books']], ['other'])
 
+    def test_candidate_isbn_duplicate_history_skips_and_missing_isbn_not_ready(self):
+        with self.store.db() as db:
+            db.execute("INSERT INTO history VALUES ('123','Different saved edition title','Writer','0306406152',0,'read','','','',1,'different saved edition title','writer')")
+        job = self.gr.start_match_batch()['job']
+        with patch.object(self.gr.catalog, 'request', return_value=GOOGLE):
+            result = self.gr.resolve({'book_ids': ['one'], 'batch_id': job['id']})
+        self.assertEqual(result['job']['items'][0]['state'], 'skipped')
+        self.assertFalse(self.gr.review()['books'][0]['ready'])
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM gr_matches').fetchone()[0], 0)
+
+    def test_unknown_and_different_language_are_export_ready(self):
+        for lang in ('', 'German'):
+            self.abs.items[0]['media']['metadata']['language'] = lang
+            self.store.sync()
+            with self.store.db() as db:
+                db.execute('DELETE FROM gr_matches')
+            self.assertTrue(self.resolve()['automatic'])
+            self.assertTrue(self.gr.review()['books'][0]['ready'])
+
+    def test_batch_without_catalog_isbn_stays_review(self):
+        google = copy.deepcopy(GOOGLE)
+        google['items'][0]['volumeInfo']['industryIdentifiers'] = []
+        job = self.gr.start_match_batch()['job']
+        with patch.object(self.gr.catalog, 'request', side_effect=[google, {'docs': []}]):
+            result = self.gr.resolve({'book_ids': ['one'], 'batch_id': job['id']})
+        self.assertEqual(result['job']['items'][0]['state'], 'review')
+        self.assertFalse(self.gr.review()['books'][0]['ready'])
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM gr_matches').fetchone()[0], 0)
+
     def test_action_bounds_and_existing_decision_not_overwritten(self):
         for ids in ([], ['one'] * 2, list(map(str, range(11))), 'one', [1]):
             with self.assertRaises(AppError): self.gr.resolve({'book_ids': ids})
@@ -262,15 +335,15 @@ class ExportAutomationTests(unittest.TestCase):
         with self.store.db() as db:
             self.assertEqual(db.execute('SELECT count(*) FROM gr_matches').fetchone()[0], 0)
 
-    def test_incident_missing_language_and_narrator_authors_make_no_requests(self):
+    def test_incident_narrator_authors_remain_review_without_catalog_corroboration(self):
         for metadata in ({'title': 'The Wildest Dreams Bookshop', 'authorName': 'Gracie Page, Venice Van Someren', 'language': '', 'narratorName': 'Venice Van Someren'},
                          {'title': 'Cleat Cute', 'authorName': 'Dana Varden, Zim Avaltrades', 'language': 'english', 'narratorName': 'Dana Varden, Zim Avaltrades'}):
             self.abs.items[0]['media']['metadata'].update(metadata)
             self.store.sync()
             self.gr.auto_last = -100
-            with patch.object(self.gr.catalog, 'request') as request:
+            with patch.object(self.gr.catalog, 'request', return_value=GOOGLE) as request:
                 self.assertFalse(self.gr.auto_resolve()['results'][0]['automatic'])
-                request.assert_not_called()
+                self.assertLessEqual(request.call_count, 2)
 
     def test_3000_book_queue_never_launches_per_book_catalog_requests(self):
         for index in range(3000):
@@ -287,6 +360,90 @@ class ExportAutomationTests(unittest.TestCase):
             self.assertEqual(len(self.gr.auto_budget), 10)
             self.assertEqual(request.call_count, 20)  # at most two providers per book
             self.assertEqual(len(self.gr.review()['books']), 3001)
+
+    def test_explicit_batch_25_abs_only_durable_resume_and_outcomes(self):
+        for index in range(30):
+            book = item('batch-' + str(index), 'Batch work ' + str(index))
+            book['media']['metadata'].update(language='English', narratorName='Voice')
+            self.abs.items.append(book)
+            self.abs.user['mediaProgress'].append({'libraryItemId': book['id'], 'isFinished': True, 'finishedAt': '2026-10-01'})
+        self.store.sync()
+        with self.store.db() as db:
+            db.executemany('INSERT INTO history VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                           [(str(i), 'Seed ' + str(i), 'Seed Writer', '', 0, 'to-read', '', '', '', 0,
+                             'seed ' + str(i), 'seed writer') for i in range(3000)])
+        job = self.gr.start_match_batch()['job']
+        self.assertEqual(len(job['items']), 25)
+        self.assertEqual(self.gr.start_match_batch()['job'], job)
+        def evidence(source):
+            index = int(source['id'].split('-')[1]) if source['id'].startswith('batch-') else 0
+            candidate = {'title': source['title'], 'author': source['author'], 'isbn': '9780306406157'}
+            return {'candidate': candidate, 'high_confidence': index % 3 == 0,
+                    'provider_error': index % 3 == 2, 'provenance': 'Synthetic catalog', 'reason': 'Synthetic evidence'}
+        with patch.object(self.gr.catalog, 'resolve', side_effect=evidence) as lookup:
+            for entry in job['items'][:7]:
+                self.gr.resolve({'book_ids': [entry['id']], 'batch_id': job['id']})
+            self.assertEqual(lookup.call_count, 7)
+            # Reopening/restarting resumes the same job without repeating attempts.
+            restarted = Goodreads(self.store)
+            resumed = restarted.start_match_batch()['job']
+            self.assertEqual(resumed['id'], job['id'])
+            with patch.object(restarted.catalog, 'resolve', side_effect=evidence) as second:
+                restarted.resolve({'book_ids': [job['items'][0]['id']], 'batch_id': job['id']})
+                self.assertEqual(second.call_count, 0)
+                for entry in resumed['items']:
+                    if entry['state'] == 'queued':
+                        restarted.resolve({'book_ids': [entry['id']], 'batch_id': job['id']})
+                self.assertEqual(second.call_count, 18)
+        done = restarted.match_job()
+        self.assertTrue(all(i['state'] in ('ready', 'review', 'provider_error') for i in done['items']))
+        review = restarted.review()['books']
+        attempted_ids = {i['id'] for i in done['items']}
+        self.assertTrue(all(not b['match_eligible'] for b in review if b['id'] in attempted_ids))
+        suggestions = [b for b in review if b.get('suggestion')]
+        self.assertTrue(suggestions)
+        self.assertTrue(all(not b['confirmed'] and not b['ready'] for b in suggestions))
+        self.assertEqual(len(restarted.start_match_batch()['job']['items']), 6)
+        self.assertEqual(self.abs.writes, [])
+        with self.assertRaises(AppError):
+            restarted.resolve({'book_ids': ['123'], 'batch_id': job['id']})
+        with self.assertRaises(AppError):
+            restarted.resolve({'book_ids': [i['id'] for i in job['items'][:2]], 'batch_id': job['id']})
+
+    def test_batch_changed_decision_skipped_and_interrupted_never_repeated(self):
+        job = self.gr.start_match_batch()['job']
+        self.gr.save({'book_id': 'one', 'title': 'One', 'author': 'Writer', 'isbn': '0306406152',
+                      'completed_date': '2026-10-01', 'confirmed': False})
+        with patch.object(self.gr.catalog, 'resolve') as lookup:
+            result = self.gr.resolve({'book_ids': ['one'], 'batch_id': job['id']})
+            lookup.assert_not_called()
+        self.assertEqual(result['job']['items'][0]['state'], 'skipped')
+        with self.store.db() as db:
+            # Model an interrupted request claim; production never clears attempts.
+            snapshot = self.gr.review()['books'][0]['source_snapshot']
+            db.execute("UPDATE gr_match_job_items SET state='pending',result=?", (json.dumps({'automatic': False}),))
+            db.execute('INSERT INTO gr_catalog_attempts VALUES (?,?,?)',
+                       ('one', snapshot, json.dumps({'reason': 'Interrupted', 'provider_error': True})))
+        restarted = Goodreads(self.store)
+        with patch.object(restarted.catalog, 'resolve') as lookup:
+            restarted.resolve({'book_ids': ['one'], 'batch_id': job['id']})
+            restarted.auto_resolve()
+            lookup.assert_not_called()
+        self.assertEqual(restarted.review()['books'][0]['isbn'], '0306406152')
+
+    def test_batch_provider_throttle_is_durable_review_not_retry(self):
+        job = self.gr.start_match_batch()['job']
+        response, opener = MagicMock(), MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"items": [], "docs": []}'
+        opener.open.return_value = response
+        self.gr.catalog.last = {'Google Books': 100, 'Open Library': 100}
+        with patch('isbn_catalog.time.monotonic', return_value=101), patch('isbn_catalog.urllib.request.build_opener', return_value=opener):
+            result = self.gr.resolve({'book_ids': ['one'], 'batch_id': job['id']})
+            self.assertEqual(result['job']['items'][0]['state'], 'provider_error')
+            self.gr.resolve({'book_ids': ['one'], 'batch_id': job['id']})
+            opener.open.assert_not_called()
+        self.assertFalse(Goodreads(self.store).review()['books'][0]['match_eligible'])
 
 
 if __name__ == '__main__':

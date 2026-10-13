@@ -239,6 +239,26 @@ class ReceiverHTTPTests(test_http.HTTPTests):
                         {'X-Selector-Request': '1', 'Host': 'attacker.example'}):
             self.assertEqual(self.request('/api/goodreads/resolve', {'book_ids': ['one']}, headers)[0], 403)
             self.assertEqual(self.request('/api/goodreads/auto-resolve', {}, headers)[0], 403)
+            self.assertEqual(self.request('/api/goodreads/match-batch', {}, headers)[0], 403)
+
+    def test_batch_queue_api_has_no_network_until_one_book_resolve(self):
+        from test_isbn_catalog import GOOGLE
+        with self.store.db() as db:
+            db.execute("UPDATE books SET finished=1,finished_at='2026-10-01',language='English' WHERE id='one'")
+        headers = {'X-Selector-Request': '1'}
+        with patch('isbn_catalog.Catalog.request', return_value=GOOGLE) as request:
+            status, _, body = self.request('/api/goodreads/match-batch', {'book_ids': ['seed'], 'title': 'PRIVATE'}, headers)
+            self.assertEqual(status, 200)
+            job = json.loads(body)['job']
+            self.assertEqual(job['items'], [{'id': 'one', 'state': 'queued'}])
+            request.assert_not_called()
+            status, _, body = self.request('/api/goodreads/resolve', {'book_ids': ['one'], 'batch_id': job['id']}, headers)
+            self.assertEqual(status, 200)
+            self.assertTrue(json.loads(body)['results'][0]['automatic'])
+            self.assertEqual(request.call_count, 1)
+            self.request('/api/goodreads/resolve', {'book_ids': ['one'], 'batch_id': job['id']}, headers)
+            self.assertEqual(request.call_count, 1)
+            self.assertNotIn('PRIVATE', str(request.call_args_list))
 
     def test_catalog_resolution_api_uses_source_metadata_not_client_search_or_private_feedback(self):
         from test_isbn_catalog import GOOGLE

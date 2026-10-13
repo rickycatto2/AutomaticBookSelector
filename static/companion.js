@@ -1,5 +1,47 @@
 /* Goodreads public exports and measured BookRamp statistics. No paid AI calls. */
 let grSelected = new Set(), grBooks = [], grTicket = 0, statsTicket = 0, latestStats;
+let grMatchJob = null, grBatchRunning = false, grBatchCancelled = false, grBatchWake = null, grDirty = false, grAutoBusy = false;
+function grMatchProgress(note = '') {
+  if (!grMatchJob) {$('#gr-match-progress').textContent = note; return;}
+  const items = grMatchJob.items, count = state => items.filter(i => i.state === state).length;
+  $('#gr-match-progress').textContent = `${items.length - count('queued')} / ${items.length} processed · ${count('ready')} ready · ${count('review')} review · ${count('skipped')} skipped · ${count('provider_error') + count('pending')} provider errors / interrupted.${note ? ' ' + note : ''}`;
+  $('#gr-match-eligible').textContent = count('queued') ? 'Match eligible books (resume)' : 'Match eligible books';
+}
+async function matchEligibleBooks() {
+  if (grBatchRunning) return;
+  if (grDirty || grAutoBusy) {message(grDirty ? 'Save or reload unsaved edits before matching.' : 'Wait for the current automatic check to finish.', true); return;}
+  grBatchRunning = true; grBatchCancelled = false;
+  $('#gr-match-eligible').disabled = true; $('#gr-match-cancel').hidden = false;
+  $('#gr-books').inert = true; $('#gr-reload').disabled = true;
+  try {
+    const response = await api('/api/goodreads/match-batch', {}); grMatchJob = response.job;
+    if (!grMatchJob) {grMatchProgress('No eligible undecided books. Review existing suggestions per book.'); return;}
+    // The server owns the bounded durable queue; never iterate the Goodreads seed.
+    for (const item of grMatchJob.items.filter(i => i.state === 'queued').slice(0, 25)) {
+      if (grBatchCancelled) break;
+      grMatchProgress('Waiting five seconds before the next book…');
+      await new Promise(resolve => {const timer = setTimeout(() => {grBatchWake = null; resolve();}, 5000); grBatchWake = () => {clearTimeout(timer); grBatchWake = null; resolve();};});
+      if (grBatchCancelled) break;
+      grMatchProgress('Matching one book…');
+      const resolved = await api('/api/goodreads/resolve', {book_ids: [item.id], batch_id: grMatchJob.id});
+      grMatchJob = resolved.job; grMatchProgress();
+    }
+    await loadGoodreads(false);
+    grMatchProgress(grBatchCancelled ? 'Paused. Resume explicitly when ready.' : 'Finished. Review uncertain results; nothing uploaded.');
+  } catch (error) {
+    // A lost response may have committed. Reload durable state before any resume;
+    // never retry the in-flight request automatically.
+    try {await loadGoodreads(false);} catch (_) {}
+    grMatchProgress('Stopped: ' + error.message + ' Reload before resuming if status is unavailable.');
+    message(error.message, true);
+  } finally {
+    grBatchRunning = false; $('#gr-match-eligible').disabled = false; $('#gr-match-cancel').hidden = true;
+    $('#gr-books').inert = false; $('#gr-reload').disabled = false;
+  }
+}
+$('#gr-match-eligible').addEventListener('click', matchEligibleBooks);
+$('#gr-match-cancel').addEventListener('click', () => {grBatchCancelled = true; if (grBatchWake) grBatchWake(); grMatchProgress('Pausing after the current request…');});
+$('#gr-books').addEventListener('input', () => {grDirty = true;});
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob), link = el('a'); link.href = url; link.download = filename;
   document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 30000);
@@ -34,6 +76,7 @@ function canonicalIsbn(value) {
 async function loadGoodreads(automatic = true) {
   const ticket = ++grTicket, result = await api('/api/goodreads'); if (ticket !== grTicket) return;
   grBooks = result.books; grSelected = new Set([...grSelected].filter(id => grBooks.some(b => b.id === id && b.ready)));
+  grMatchJob = result.match_job || null; grDirty = false; grMatchProgress();
   $('#gr-books').replaceChildren(); $('#gr-summary').textContent = `${result.books.filter(b => b.ready).length} ready to export; ${result.books.filter(b => !b.ready).length} need review or a catalog check. ${result.excluded} entries excluded because they were already read, exported, duplicated, ignored, or marked did not finish.`;
   if (!result.books.length) $('#gr-books').append(el('div', 'empty', 'All caught up. New completions will appear here.'));
   for (const book of result.books) {
@@ -41,6 +84,7 @@ async function loadGoodreads(automatic = true) {
     check.addEventListener('change', () => {check.checked ? grSelected.add(book.id) : grSelected.delete(book.id); grCount();});
     checkLabel.append(check, el('span', '', book.original_title)); heading.append(checkLabel);
     const status = el('p', 'muted', (book.ready ? 'Ready to export. ' : 'Review required. ') + book.provenance + ': ' + book.reason); card.append(heading, el('p', 'muted', book.original_author), status);
+    if (book.evidence?.length) card.append(el('p', 'muted', `Evidence score ${book.score}/100 · auto threshold ${book.threshold} plus linked ISBN identity. Edition/language differences are allowed; Goodreads acceptance remains unverified.`));
     const lookupError = el('p', 'error-note'); lookupError.hidden = true; lookupError.setAttribute('role', 'alert'); card.append(lookupError);
     const lookupAction = (button, fn) => action(button, async () => {
       lookupError.hidden = true;
@@ -48,10 +92,12 @@ async function loadGoodreads(automatic = true) {
     });
     if (book.failure) card.append(el('p', 'error-note', 'Previous import failed: ' + book.failure.slice(0, 500) + '. Correct the match and confirm it again.'));
     const detail = el('details'), summary = el('summary', '', 'Review book & public rating'), form = el('form', 'gr-form');
+    if (book.suggestion) card.append(el('p', 'muted', `Saved catalog suggestion (unconfirmed): ${book.suggestion.title} — ${book.suggestion.author} · ${book.suggestion.isbn}. Use Find work ISBN or copy these details for review.`));
+    for (const candidate of (book.candidates || []).slice(0, 10)) card.append(el('p', 'muted', `Catalog evidence (not a confirmed match): ${candidate.title} — ${candidate.author} · ${(candidate.isbns || []).join(', ')}`));
     form.append(field('Goodreads title', 'title', book.title), field('Author(s) — review roles; do not drop coauthors', 'author', book.author), field('ISBN — catalog listing does not guarantee Goodreads acceptance', 'isbn', book.isbn), field('Goodreads book link', 'url', book.url, 'url'), field('Date completed — exported as Date Read', 'completed_date', book.completed_date, 'date'));
     const ratingLabel = el('label', '', 'Public Goodreads stars'), rating = el('select'); rating.name = 'public_rating';
     for (const [value, text] of [['', 'Leave unrated'], ['1', '★'], ['2', '★★'], ['3', '★★★'], ['4', '★★★★'], ['5', '★★★★★']]) { const option = el('option', '', text); option.value = value; rating.append(option); } rating.value = book.public_rating ?? ''; ratingLabel.append(rating); form.append(ratingLabel, el('p', 'muted', 'These stars are only for Goodreads. Your private rating, notes and recommendations stay separate.'));
-    const confirmLabel = el('label', 'check'), confirmed = el('input'); confirmed.type = 'checkbox'; confirmed.name = 'confirmed'; confirmed.checked = Boolean(book.confirmed && !book.source_changed); confirmLabel.append(confirmed, el('span', '', 'I checked the work, author(s), language and ISBN edition. A reviewed print edition may represent the audiobook; ISBN checksum alone is not a match.')); form.append(confirmLabel);
+    const confirmLabel = el('label', 'check'), confirmed = el('input'); confirmed.type = 'checkbox'; confirmed.name = 'confirmed'; confirmed.checked = Boolean(book.confirmed && !book.source_changed); confirmLabel.append(confirmed, el('span', '', 'I checked the work and full author set. A print, Kindle, large-print or translated edition may represent the audiobook; ISBN checksum alone is not a match.')); form.append(confirmLabel);
     const actions = el('div', 'question-buttons');
     const search = el('a', 'button-link secondary', 'Find Goodreads match'), printSearch = el('a', 'button-link secondary', 'Find print/ebook edition');
     // External Google search only; no crawling and no Goodreads request. The
@@ -102,7 +148,8 @@ async function loadGoodreads(automatic = true) {
   $('#gr-reconcile-form').hidden = !result.batches.length; grCount();
   // One bounded server-side attempt, not a per-card loop or retry scheduler.
   // Do not discard edits/selections while a slow provider request is in flight.
-  if (automatic === true) {
+  if (automatic === true && !grBatchRunning) {
+    grAutoBusy = true;
     let edited = false;
     const markEdited = () => {edited = true;};
     $('#gr-books').addEventListener('input', markEdited, {once: true});
@@ -111,7 +158,7 @@ async function loadGoodreads(automatic = true) {
       const resolved = await api('/api/goodreads/auto-resolve', {});
       if (resolved.results.length && ticket === grTicket && !edited && !grSelected.size) await loadGoodreads(false);
     } catch (error) { if (ticket === grTicket) message('Automatic ISBN check: ' + error.message, true); }
-    finally { $('#gr-books').removeEventListener('input', markEdited); $('#gr-books').removeEventListener('click', markEdited); }
+    finally { grAutoBusy = false; $('#gr-books').removeEventListener('input', markEdited); $('#gr-books').removeEventListener('click', markEdited); }
   }
 }
 $('#gr-select-ready').addEventListener('click', () => {for (const check of $('#gr-books').querySelectorAll('input[type=checkbox][aria-label]')) if (!check.disabled && !check.checked) check.click();});

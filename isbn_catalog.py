@@ -6,15 +6,26 @@ import time
 import urllib.parse
 import urllib.request
 
-from core import AppError, NoRedirect, normalize, isbn as canonical_isbn
+from core import AppError, NoRedirect, normalize
 
 ENDPOINTS = {'Google Books': 'https://www.googleapis.com/books/v1/volumes',
              'Open Library': 'https://openlibrary.org/search.json'}
 
 
 def work_title(value):
-    # Only explicit format decorations, not subtitles/series/work numbers.
-    return normalize(re.sub(r'\s*\((?:audio(?:book)? edition|unabridged|large print|ebook)\)\s*$', '', value or '', flags=re.I))
+    return normalize(re.sub(r'\s*\((?:audio(?:book)? edition|unabridged|large print|ebook|[^()]+(?:\bbook|\bvolume|#)\s*\d+)\)\s*$', '', value or '', flags=re.I))
+
+
+def title_evidence(left, right):
+    if work_title(left) == work_title(right):
+        return 40, 'Exact normalized work title'
+    # Do not fuzz titles or discard two conflicting subtitles. A short/generic
+    # base is not enough evidence; author equality is also required by resolve.
+    a, b = left.split(':', 1), right.split(':', 1)
+    base = work_title(a[0])
+    if len(a) != len(b) and base == work_title(b[0]) and len(base.split()) >= 3 and len(base) >= 12:
+        return 35, 'Conservative subtitle-insensitive work title'
+    return 0, 'Work title not established'
 
 
 def authors(value):
@@ -73,23 +84,26 @@ class Catalog:
                 candidates.append({'title': v.get('title', '') + (': ' + v['subtitle'] if v.get('subtitle') else ''),
                                    'author': ', '.join(v.get('authors') or []), 'languages': [v.get('language', '')],
                                    'isbns': [i.get('identifier', '') for i in v.get('industryIdentifiers', [])],
-                                   'reference': str(item.get('id', ''))})
+                                    'reference': str(item.get('id', '')), 'publisher': v.get('publisher', ''),
+                                    'print': not bool((item.get('saleInfo') or {}).get('isEbook'))})
             return candidates, data.get('totalItems', 0) > 10
         data = self.request(provider, {'title': title, 'author': author, 'limit': 10,
-                                      'fields': 'key,title,author_name,isbn,language'})
+                                       'fields': 'key,title,author_name,isbn,language,editions,editions.key,editions.title,editions.author_name,editions.isbn'})
         return [{'title': v.get('title', ''), 'author': ', '.join(v.get('author_name') or []),
                  'languages': v.get('language') or [], 'isbns': (v.get('isbn') or [])[:100],
-                 'reference': str(v.get('key', ''))} for v in (data.get('docs') or [])[:10]], data.get('numFound', 0) > 10
+                  'reference': str(v.get('key', '')), 'editions': (v.get('editions') or {}).get('docs', [])[:10]}
+                for v in (data.get('docs') or [])[:10]], data.get('numFound', 0) > 10
 
     def resolve(self, source):
         from goodreads import valid_isbn
         title, author = source['title'], source['author']
-        base = {'provenance': '', 'reason': '', 'candidate': None, 'high_confidence': False}
+        base = {'provenance': '', 'reason': '', 'candidate': None, 'high_confidence': False,
+                'score': 0, 'threshold': 90, 'evidence': [], 'goodreads_isbn_url': ''}
         if any(not isinstance(v, str) or not v.strip() or len(v) > 1000 or v.lstrip()[0] in '=+-@' for v in (title, author)):
             return base | {'reason': 'Unsafe or missing title/author fields; manual review required.'}
-        if not work_title(title) or not authors(author) or not language(source.get('language')):
-            return base | {'reason': 'Missing work, full author or known source language; manual review required.'}
-        if re.search(r'\b(?:translator|narrator|translated|narrated)\b', author, re.I) or authors(author) == authors(source.get('narrator', '')):
+        if not work_title(title) or not authors(author):
+            return base | {'reason': 'Missing work or full author; manual review required.'}
+        if re.search(r'\b(?:translator|narrator|translated|narrated)\b', author, re.I):
             return base | {'reason': 'Contributor roles are uncertain; correct/review authors without silently dropping names.'}
         errors = []
         for provider in ENDPOINTS:
@@ -98,40 +112,57 @@ class Catalog:
             except (AppError, ValueError, TypeError, AttributeError) as exc:
                 errors.append(str(exc))
                 continue
-            relevant = [c for c in candidates if work_title(c['title']) == work_title(title)]
+            relevant = [c for c in candidates if title_evidence(c['title'], title)[0]]
             if not relevant:
                 continue
             result = base | {'provenance': provider, 'candidates': relevant}
+            if any(not isinstance(v, str) or not v.strip() or len(v) > 1000 or v.lstrip()[0] in '=+-@'
+                   for c in relevant for v in (c['title'], c['author'])):
+                return result | {'reason': 'Unsafe catalog title/author fields; manual review required.'}
             if truncated:
                 return result | {'reason': 'Search is truncated; multiple works may exist. Review required.'}
             if any(authors(c['author']) != authors(author) for c in relevant):
                 return result | {'reason': 'Same-title author mismatch or ambiguous works; review required.'}
-            if any(not c['languages'] or {language(v) for v in c['languages']} != {language(source['language'])} for c in relevant):
-                return result | {'reason': 'Unknown or conflicting edition language; review required.'}
+            subtitles = {work_title(c['title']) for c in relevant if ':' in c['title']}
+            if len(subtitles) > 1:
+                return result | {'reason': 'Conflicting subtitles may identify different works; review required.'}
             codes = [(c, sorted({valid_isbn(i) for i in c['isbns']} - {''})) for c in relevant]
             usable = [(c, values) for c, values in codes if values]
             # Distinct Open Library work IDs cannot be assumed to be duplicate editions.
-            if provider == 'Open Library' and len({c['reference'] for c in relevant}) > 1:
+            if provider == 'Open Library' and (len({c['reference'] for c in relevant}) > 1
+                                             or not all(re.fullmatch(r'/works/[A-Za-z0-9]+', c['reference']) for c in relevant)):
                 return result | {'reason': 'Multiple distinct catalog works; review required.'}
-            if provider == 'Google Books' and len(relevant) > 1:
-                # Volume IDs are editions, not work IDs. Without shared identifiers we
-                # cannot prove that same-named volumes are editions of one work.
-                shared = set(canonical_isbn(i) for i in codes[0][1])
-                for _, values in codes[1:]:
-                    shared &= {canonical_isbn(i) for i in values}
-                if not shared:
-                    return result | {'reason': 'Multiple catalog volumes without shared edition identifiers/work linkage; review required.'}
             if not usable:
                 errors.append(provider + ': no valid ISBN')
                 continue
-            c, values = usable[0]
-            if provider == 'Google Books' and len(relevant) > 1:
-                values = [i for i in values if canonical_isbn(i) in shared]
+            # Prefer publisher/print evidence, then ISBN-13 and a stable ISBN/ID
+            # ordering. No invented or source-derived identifier is introduced.
+            choices = [(c, i) for c, values in usable for i in values]
+            c, code = min(choices, key=lambda pair: (not bool(pair[0].get('publisher')),
+                          not pair[0].get('print', False), len(pair[1]) != 13, pair[1], pair[0]['reference']))
+            linked = provider == 'Google Books'
             if provider == 'Open Library':
-                # Search returns work-level aggregated ISBNs/languages, not a linked edition.
-                # Do not pretend this establishes the language/authors of the selected ISBN.
-                return result | {'candidate': {'title': c['title'], 'author': c['author'], 'isbn': values[0], 'reference': c['reference']},
-                                 'reason': 'Open Library work-index ISBN suggestion only; edition-level language/author linkage needs manual review. Goodreads acceptance is unverified.'}
-            return result | {'candidate': {'title': c['title'], 'author': c['author'], 'isbn': values[0], 'reference': c['reference']},
-                             'high_confidence': True, 'reason': 'Exact work/full authors/language and checksum-valid catalog ISBN. Goodreads import acceptance is unverified.'}
-        return base | {'reason': '; '.join(errors) or 'No exact catalog work with a valid ISBN found; review required.'}
+                editions = [(e, valid_isbn(i)) for e in c.get('editions', [])
+                            if str(e.get('key', '')).startswith('/books/')
+                            and title_evidence(e.get('title', ''), title)[0]
+                            and authors(', '.join(e.get('author_name') or [])) == authors(author)
+                            for i in e.get('isbn', []) if valid_isbn(i)]
+                if editions:
+                    e, code = min(editions, key=lambda pair: (len(pair[1]) != 13, pair[1], pair[0]['key']))
+                    linked = True
+            points, title_why = title_evidence(c['title'], title)
+            evidence = [title_why + f' (+{points})', 'Independent catalog corroborates full author set (+35)',
+                        'Checksum-valid catalog ISBN (+15)', 'Linked edition identity (+10)' if linked else 'Work-index ISBN lacks edition/author linkage (+0)']
+            score = points + 35 + 15 + (10 if linked else 0)
+            same_language = language(source.get('language')) and {language(v) for v in c['languages']} == {language(source.get('language'))}
+            evidence.append('Edition difference: unknown/different language is neutral (+0)' if not same_language else 'Matching language (neutral +0)')
+            if authors(author) == authors(source.get('narrator', '')):
+                evidence.append('Possible self-narration: full author set independently corroborated')
+            high = linked and score >= base['threshold']
+            candidate = {'title': c['title'], 'author': c['author'], 'isbn': code, 'reference': c['reference']}
+            return result | {'candidate': candidate, 'score': score, 'evidence': evidence,
+                             'goodreads_isbn_url': 'https://www.goodreads.com/book/isbn/' + code,
+                             'high_confidence': high, 'reason': f'Score {score}/100; auto threshold 90 with linked ISBN evidence. ' + '; '.join(evidence) +
+                             ('. ' if high else '. Edition evidence insufficient; review required. ') + 'Goodreads import acceptance is unverified.'}
+        return base | {'provider_error': any('unavailable' in e or 'five seconds' in e for e in errors),
+                       'reason': '; '.join(errors) or 'No exact catalog work with a valid ISBN found; review required.'}

@@ -229,11 +229,20 @@ class Goodreads:
             db.execute('''CREATE TABLE IF NOT EXISTS gr_match_context (
                 book_id TEXT PRIMARY KEY,source_snapshot TEXT NOT NULL,provenance TEXT NOT NULL,
                 reason TEXT NOT NULL,evidence TEXT NOT NULL,automatic INTEGER NOT NULL DEFAULT 0)''')
+            db.executescript('''CREATE TABLE IF NOT EXISTS gr_catalog_attempts (
+                book_id TEXT NOT NULL,source_snapshot TEXT NOT NULL,result TEXT NOT NULL,
+                PRIMARY KEY(book_id,source_snapshot));
+              CREATE TABLE IF NOT EXISTS gr_match_jobs (id TEXT PRIMARY KEY,created_at TEXT NOT NULL);
+              CREATE TABLE IF NOT EXISTS gr_match_job_items (
+                job_id TEXT NOT NULL,book_id TEXT NOT NULL,source_snapshot TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'queued',result TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(job_id,book_id));''')
 
     def review(self):
         with self.store.db() as db:
             history = [dict(r) for r in db.execute('SELECT * FROM history')]
             read_titles = {work_identity(h) for h in history if h['shelf'] == 'read' or h['date_read'] or h['read_count']}
+            read_isbns = {canonical_isbn(h['isbn']) for h in history if h['shelf'] == 'read' or h['date_read'] or h['read_count']} - {''}
             seeds = {work_identity(h): h for h in history}
             matches = {r['book_id']: dict(r) for r in db.execute('SELECT * FROM gr_matches')}
             exported = [dict(r) for r in db.execute("""SELECT i.* FROM gr_export_items i
@@ -241,8 +250,11 @@ class Goodreads:
                 AND NOT EXISTS (SELECT 1 FROM gr_export_items newer JOIN gr_exports ne ON ne.id=newer.batch_id
                     WHERE newer.book_id=i.book_id AND ne.rowid>e.rowid)""")]
             exports = {work_identity(r) for r in exported}
+            export_isbns = {canonical_isbn(r['isbn']) for r in exported} - {''}
             exported_ids = {r['book_id'] for r in exported}
             contexts = {r['book_id']: dict(r) for r in db.execute('SELECT * FROM gr_match_context')}
+            attempts = {(r['book_id'], r['source_snapshot']): json.loads(r['result'])
+                        for r in db.execute('SELECT * FROM gr_catalog_attempts')}
             failures = {r['book_id']: r['failure'] for r in db.execute("SELECT book_id,failure FROM gr_export_items WHERE state='failed' ORDER BY rowid")}
             rows = [dict(r) for r in db.execute('''SELECT b.*,COALESCE(f.dnf,0) AS dnf,
                 (SELECT max(completion_timestamp) FROM bookramp_sessions s WHERE s.abs_item_id=b.id AND s.completion_crossed=1) AS ramp_finished
@@ -256,7 +268,7 @@ class Goodreads:
         for b in sorted(rows, key=lambda b: (b['id'] in failures, str(b['finished_at'] or b['ramp_finished'] or '')), reverse=True):
             key = work_identity(b)
             match = matches.get(b['id'], {})
-            if b['dnf'] or key in read_titles or key in exports or b['id'] in exported_ids or key in seen or match.get('ignored'):
+            if b['dnf'] or key in read_titles or key in exports or canonical_isbn(b['isbn']) in read_isbns | export_isbns or b['id'] in exported_ids or key in seen or match.get('ignored'):
                 excluded += 1
                 continue
             seen.add(key)
@@ -274,14 +286,90 @@ class Goodreads:
                 saved['reason'] = 'Source metadata changed or prior confirmation has no source snapshot. Re-review required; saved details retained.'
             saved['ready'] = bool(not saved['source_changed'] and saved['confirmed'] and valid_isbn(saved['isbn']) and genuine_date(saved['completed_date']) and saved['title'] and saved['author'])
             saved['automatic'] = bool(context.get('automatic'))
+            persisted = attempts.get((b['id'], saved['source_snapshot']))
+            evidence = persisted or json.loads(context.get('evidence') or '{}')
+            saved['score'] = evidence.get('score', 0)
+            saved['threshold'] = evidence.get('threshold', 90)
+            saved['evidence'] = evidence.get('evidence', [])
+            saved['match_eligible'] = not bool(match or saved['failure'] or persisted)
+            if persisted and not match:
+                saved['reason'] = persisted.get('reason', 'Previous lookup interrupted; use per-book review.')
+                saved['provenance'] = persisted.get('provenance') or 'Free catalog check'
+                saved['suggestion'] = persisted.get('candidate')
+                saved['candidates'] = persisted.get('candidates', [])
             attempt = self.auto_attempts.get(saved['source_snapshot'])
-            if attempt and time.monotonic() - attempt[0] < 86400 and not match:
+            if attempt and time.monotonic() - attempt[0] < 86400 and not match and not persisted:
                 suggestion = attempt[1]
                 saved['reason'] = suggestion['reason']
                 saved['provenance'] = suggestion.get('provenance') or 'Automatic catalog check'
                 saved['suggestion'] = suggestion.get('candidate')
             books.append(saved)
-        return {'books': books, 'excluded': excluded, 'batches': batches}
+        return {'books': books, 'excluded': excluded, 'batches': batches, 'match_job': self.match_job()}
+
+    def match_job(self, job_id=None):
+        with self.store.db() as db:
+            job = db.execute('SELECT * FROM gr_match_jobs WHERE id=?', (job_id,)).fetchone() if job_id else db.execute(
+                'SELECT * FROM gr_match_jobs ORDER BY rowid DESC LIMIT 1').fetchone()
+            if not job:
+                return None
+            items = [dict(r) for r in db.execute(
+                'SELECT book_id AS id,state FROM gr_match_job_items WHERE job_id=? ORDER BY rowid', (job['id'],))]
+        return {'id': job['id'], 'items': items}
+
+    def start_match_batch(self):
+        """Create/resume a durable queue only; no network or background execution."""
+        with self.store.lock, self.store.db() as db:
+            job = self.match_job()
+            if job and any(i['state'] == 'queued' for i in job['items']):
+                return {'job': job}
+            books = [b for b in self.review()['books'] if b['match_eligible']][:25]
+            if not books:
+                return {'job': job}
+            job_id = uuid.uuid4().hex
+            db.execute('INSERT INTO gr_match_jobs VALUES (?,?)', (job_id, now()))
+            db.executemany('INSERT INTO gr_match_job_items(job_id,book_id,source_snapshot) VALUES (?,?,?)',
+                           [(job_id, b['id'], b['source_snapshot']) for b in books])
+        return {'job': self.match_job(job_id)}
+
+    def resolve_batch_item(self, p):
+        ids, job_id = p.get('book_ids'), p.get('batch_id')
+        if not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str) or not isinstance(job_id, str):
+            raise AppError('A matching batch resolves one queued ABS book per request.')
+        book_id = ids[0]
+        with self.store.lock, self.store.db() as db:
+            row = db.execute('SELECT * FROM gr_match_job_items WHERE job_id=? AND book_id=?', (job_id, book_id)).fetchone()
+            if not row:
+                raise AppError('Book is not in this bounded matching batch.')
+            if row['state'] != 'queued':
+                return {'results': [json.loads(row['result']) | {'id': book_id}], 'job': self.match_job(job_id)}
+            book = next((b for b in self.review()['books'] if b['id'] == book_id), None)
+            if not book or not book['match_eligible'] or book['source_snapshot'] != row['source_snapshot']:
+                result = {'id': book_id, 'automatic': False, 'reason': 'Skipped: decision, source or export state changed.'}
+                db.execute("UPDATE gr_match_job_items SET state='skipped',result=? WHERE job_id=? AND book_id=?",
+                           (json.dumps(result), job_id, book_id))
+                # Return after transaction commit below.
+                skipped = True
+            else:
+                skipped = False
+                result = {'id': book_id, 'automatic': False, 'provider_error': True,
+                          'reason': 'Lookup in flight or interrupted. No automatic retry; use per-book review if needed.'}
+                db.execute("UPDATE gr_match_job_items SET state='pending',result=? WHERE job_id=? AND book_id=?",
+                           (json.dumps(result), job_id, book_id))
+                db.execute('INSERT INTO gr_catalog_attempts VALUES (?,?,?)',
+                           (book_id, row['source_snapshot'], json.dumps(result)))
+        if not skipped:
+            try:
+                result = self.resolve({'book_ids': ids, '_batch_snapshot': row['source_snapshot']})['results'][0]
+            except Exception:
+                result = {'id': book_id, 'automatic': False, 'provider_error': True,
+                          'reason': 'Lookup failed or state changed. Nothing overwritten; review this book explicitly.'}
+            state = 'skipped' if result.get('skipped') else 'ready' if result.get('automatic') else 'provider_error' if result.get('provider_error') else 'review'
+            with self.store.lock, self.store.db() as db:
+                db.execute('UPDATE gr_match_job_items SET state=?,result=? WHERE job_id=? AND book_id=?',
+                           (state, json.dumps(result), job_id, book_id))
+                db.execute('INSERT OR REPLACE INTO gr_catalog_attempts VALUES (?,?,?)',
+                           (book_id, row['source_snapshot'], json.dumps(result)))
+        return {'results': [result], 'job': self.match_job(job_id)}
 
     def save(self, p):
         if any(k in p and type(p[k]) is not bool for k in ('confirmed', 'ignored')):
@@ -324,6 +412,8 @@ class Goodreads:
         return {'saved': True}
 
     def resolve(self, p):
+        if 'batch_id' in p:
+            return self.resolve_batch_item(p)
         ids = p.get('book_ids')
         if not isinstance(ids, list) or not 1 <= len(ids) <= 10 or any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids):
             raise AppError('Choose 1–10 distinct completed books for this explicit action.')
@@ -336,6 +426,11 @@ class Goodreads:
                 with self.store.db() as db:
                     source = dict(db.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
                     prior = db.execute('SELECT 1 FROM gr_matches WHERE book_id=?', (book_id,)).fetchone()
+                if p.get('_batch_snapshot') and (prior or eligible[book_id]['failure']
+                                                or p['_batch_snapshot'] != source_snapshot(source)):
+                    results.append({'id': book_id, 'automatic': False, 'skipped': True,
+                                    'reason': 'Skipped: source or saved decision changed before lookup.'})
+                    continue
             result = self.catalog.resolve(source)
             # Saved/manual/failed/stale decisions are never overwritten by automation.
             automatic = bool(result['high_confidence'] and not prior and not eligible[book_id]['failure']
@@ -349,12 +444,23 @@ class Goodreads:
                     raise AppError('Source changed during lookup; nothing saved for this book. Reload and review.')
                 if db.execute('SELECT 1 FROM gr_matches WHERE book_id=?', (book_id,)).fetchone() or latest['failure']:
                     automatic = False
+                candidate = result.get('candidate')
+                if candidate:
+                    prior_reads = [dict(r) for r in db.execute("SELECT title,author,isbn FROM history WHERE shelf='read' OR date_read<>'' OR read_count>0")]
+                    prior_exports = [dict(r) for r in db.execute("SELECT title,author,isbn FROM gr_export_items WHERE state IN ('exported','imported')")]
+                    if any(work_identity(candidate) == work_identity(r) or canonical_isbn(candidate['isbn']) == canonical_isbn(r['isbn'])
+                           for r in prior_reads + prior_exports):
+                        automatic = False
+                        result = result | {'high_confidence': False, 'skipped': True,
+                                           'reason': 'Skipped: candidate work/ISBN already in Goodreads read history or an existing export.'}
                 if automatic:
                     candidate = result['candidate']
                     db.execute('INSERT INTO gr_matches VALUES (?,?,?,?,?,?,1,NULL,?,0,?)',
                                (book_id, candidate['title'], candidate['author'], candidate['isbn'], '', '', eligible[book_id]['completed_date'], now()))
                     db.execute('INSERT OR REPLACE INTO gr_match_context VALUES (?,?,?,?,?,1)',
-                               (book_id, source_snapshot(source), result['provenance'], result['reason'], json.dumps(result)))
+                                (book_id, source_snapshot(source), result['provenance'], result['reason'], json.dumps(result)))
+                db.execute('INSERT OR REPLACE INTO gr_catalog_attempts VALUES (?,?,?)',
+                           (book_id, source_snapshot(source), json.dumps(result)))
             results.append(result | {'id': book_id, 'automatic': automatic,
                                      'reason': result['reason'] + ('' if automatic else ' Not auto-saved: review candidate, existing decision and completion date.')})
         return {'results': results}
@@ -362,7 +468,7 @@ class Goodreads:
     def auto_resolve(self):
         """One book per list load, ten per rolling day/process; never a bulk job.
 
-        Fingerprint attempts (including uncertainty/errors) are cached for a day.
+        Fingerprint attempts (including uncertainty/errors) are retained durably.
         Existing decisions and failed imports are never sent or overwritten.
         """
         if not self.auto_lock.acquire(blocking=False):
@@ -375,7 +481,7 @@ class Goodreads:
                 return {'results': [], 'deferred': True}
             with self.store.lock, self.store.db() as db:
                 saved_ids = {r[0] for r in db.execute('SELECT book_id FROM gr_matches')}
-                book = next((b for b in self.review()['books'] if b['id'] not in saved_ids
+                book = next((b for b in self.review()['books'] if b['match_eligible'] and b['id'] not in saved_ids
                              and not b['failure'] and b['source_snapshot'] not in self.auto_attempts), None)
             if not book:
                 return {'results': [], 'deferred': False}
