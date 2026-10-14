@@ -50,7 +50,7 @@ def import_report(text, items):
         # Goodreads supplies tab-delimited rows, including a blank Title.
         # Do not inherit failure context into arbitrary prose or success rows.
         cells = line.split('\t')
-        table_row = bool(table and len(cells) == 3 and valid_isbn(cells[0].strip()))
+        table_row = bool(table and len(cells) == 3 and valid_identifier(cells[0].strip()))
         if table_row:
             table_rows += 1
         if clean in ('failed books', 'failed imports', 'errors', 'rejected books'):
@@ -71,14 +71,15 @@ def import_report(text, items):
         if section and not negative and not positive:
             # Section inheritance is only safe for bare identity rows, not
             # arbitrary prose mentioning an ISBN (e.g. "no errors for ISBN").
-            bare_code = valid_isbn(re.sub(r'^ISBN\s*:\s*', '', payload, flags=re.I))
+            bare_code = valid_identifier(re.sub(r'^(?:ISBN|ASIN)\s*:\s*', '', payload, flags=re.I))
             bare_work = any(normalize(payload) == normalize(b['title'] + ' by ' + b['author']) for b in items)
             if not bare_code and not bare_work and not table_row:
                 status = ''
         codes = {canonical_isbn(valid_isbn(m.group())) for m in re.finditer(r'(?<![\w-])(?:\d[ -]?){9,}[\dXx](?![\w-])', line)} - {''}
+        codes.update(valid_asin(m.group()) for m in re.finditer(r'(?<![\w-])[A-Z0-9]{10}(?![\w-])', line))
         if table_row:
-            codes = {canonical_isbn(valid_isbn(cells[0].strip()))}
-        matches = [b for b in items if (valid_isbn(b['isbn']) and canonical_isbn(b['isbn']) in codes)
+            codes = {canonical_identifier(cells[0].strip())}
+        matches = [b for b in items if (valid_identifier(b['isbn']) and canonical_identifier(b['isbn']) in codes)
                    or normalize(payload) == normalize(b['title'] + ' by ' + b['author'])]
         if len(matches) != 1 or not status or (negative and positive):
             ambiguous = True
@@ -99,7 +100,11 @@ def import_report(text, items):
 
 
 def source_snapshot(book):
-    return hashlib.sha256(json.dumps({k: book.get(k, '') for k in ('id', 'title', 'author', 'isbn', 'language', 'narrator')}, sort_keys=True).encode()).hexdigest()
+    values = {k: book.get(k, '') for k in ('id', 'title', 'author', 'isbn', 'language', 'narrator')}
+    # Preserve existing snapshots when the additive column is still empty.
+    if book.get('asin'):
+        values['asin'] = book['asin']
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
 def work_identity(book):
@@ -145,6 +150,32 @@ def book_url(value):
     if parsed.scheme != 'https' or parsed.hostname not in ('www.goodreads.com', 'goodreads.com') or parsed.port not in (None, 443) or parsed.username or parsed.password or parsed.query or parsed.fragment or not match:
         raise AppError('Paste an HTTPS Goodreads book/show link without extra query parameters.')
     return 'https://www.goodreads.com/book/show/' + match[1], match[1]
+
+
+def valid_asin(value):
+    return value if isinstance(value, str) and re.fullmatch(r'[A-Z0-9]{10}', value) else ''
+
+
+def valid_identifier(value):
+    return valid_isbn(value) or valid_asin(value)
+
+
+def canonical_identifier(value):
+    code = valid_isbn(value)
+    return canonical_isbn(code) if code else valid_asin(value)
+
+
+def search_text(value):
+    if not isinstance(value, str):
+        raise AppError('Search title and author must be text.')
+    value = value.strip()
+    if not value or len(value) > 1000 or value[0] in '=+-@' or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise AppError('Enter a safe title and author (up to 1,000 characters each).')
+    return value
+
+
+def safe_export_text(value):
+    return isinstance(value, str) and bool(value.strip()) and value.lstrip()[0] not in '=+-@' and not any(ord(c) < 32 or ord(c) == 127 for c in value)
 
 
 class PageData(HTMLParser):
@@ -270,7 +301,7 @@ class Goodreads:
         with self.store.db() as db:
             history = [dict(r) for r in db.execute('SELECT * FROM history')]
             read_titles = {work_identity(h) for h in history if h['shelf'] == 'read' or h['date_read'] or h['read_count']}
-            read_isbns = {canonical_isbn(h['isbn']) for h in history if h['shelf'] == 'read' or h['date_read'] or h['read_count']} - {''}
+            read_isbns = {canonical_identifier(h['isbn']) for h in history if h['shelf'] == 'read' or h['date_read'] or h['read_count']} - {''}
             seeds = {work_identity(h): h for h in history}
             matches = {r['book_id']: dict(r) for r in db.execute('SELECT * FROM gr_matches')}
             exported = [dict(r) for r in db.execute("""SELECT i.* FROM gr_export_items i
@@ -278,7 +309,7 @@ class Goodreads:
                 AND NOT EXISTS (SELECT 1 FROM gr_export_items newer JOIN gr_exports ne ON ne.id=newer.batch_id
                     WHERE newer.book_id=i.book_id AND ne.rowid>e.rowid)""")]
             exports = {work_identity(r) for r in exported}
-            export_isbns = {canonical_isbn(r['isbn']) for r in exported} - {''}
+            export_isbns = {canonical_identifier(r['isbn']) for r in exported} - {''}
             exported_ids = {r['book_id'] for r in exported}
             contexts = {r['book_id']: dict(r) for r in db.execute('SELECT * FROM gr_match_context')}
             attempts = {(r['book_id'], r['source_snapshot']): json.loads(r['result'])
@@ -291,29 +322,38 @@ class Goodreads:
             batches = [dict(r) for r in db.execute('''SELECT e.id,e.created_at,
                 count(i.book_id) AS count,sum(i.state='failed') AS failed,sum(i.state='imported') AS imported
                 FROM gr_exports e JOIN gr_export_items i ON i.batch_id=e.id GROUP BY e.id ORDER BY e.created_at DESC LIMIT 20''')]
-        seen, books, excluded = set(), [], 0
+        seen, seen_identifiers, books, excluded = set(), set(), [], 0
         # Keep the actual rejected ABS ID visible ahead of duplicate editions.
         for b in sorted(rows, key=lambda b: (b['id'] in failures, str(b['finished_at'] or b['ramp_finished'] or '')), reverse=True):
             key = work_identity(b)
             match = matches.get(b['id'], {})
-            if b['dnf'] or key in read_titles or key in exports or canonical_isbn(b['isbn']) in read_isbns | export_isbns or b['id'] in exported_ids or key in seen or match.get('ignored'):
+            identifiers = {canonical_identifier(b['isbn']), valid_asin(b['asin'])} - {''}
+            if not valid_isbn(match.get('isbn')) and valid_asin(match.get('isbn')):
+                identifiers.add(valid_asin(match['isbn']))
+            if b['dnf'] or key in read_titles or key in exports or identifiers & (read_isbns | export_isbns | seen_identifiers) or b['id'] in exported_ids or key in seen or match.get('ignored'):
                 excluded += 1
                 continue
             seen.add(key)
+            seen_identifiers.update({valid_asin(code) for code in identifiers} - {''})
             seed = seeds.get(key, {})
             saved = {'book_id': b['id'], 'title': seed.get('title', b['title']), 'author': seed.get('author', b['author']),
-                     'isbn': seed.get('isbn', '') or b['isbn'], 'url': 'https://www.goodreads.com/book/show/' + seed['id'] if seed else '',
+                     'isbn': valid_asin(b['asin']) or seed.get('isbn', '') or b['isbn'], 'url': 'https://www.goodreads.com/book/show/' + seed['id'] if seed else '',
                      'confirmed': 0, 'public_rating': None, 'completed_date': completed_date(b['ramp_finished'] or b['finished_at'])} | match
-            saved.update(id=b['id'], original_title=b['title'], original_author=b['author'], audio_isbn=b['isbn'], failure=failures.get(b['id'], ''))
+            saved.update(id=b['id'], original_title=b['title'], original_author=b['author'], audio_isbn=b['isbn'], audio_asin=b['asin'], failure=failures.get(b['id'], ''))
             context = contexts.get(b['id'], {})
+            if context.get('automatic') and valid_asin(b['asin']):
+                # Only automatic catalog choices yield to the owned edition.
+                # Manual saved ISBNs and their stored decisions stay untouched.
+                saved['isbn'] = b['asin']
             saved['source_snapshot'] = source_snapshot(b)
             saved['source_changed'] = bool(match and context.get('source_snapshot') != source_snapshot(b))
             saved['provenance'] = context.get('provenance', 'Unreviewed source metadata')
             saved['reason'] = context.get('reason', 'Review work, authors, language, ISBN and genuine completion date.')
             if saved['source_changed']:
                 saved['reason'] = 'Source metadata changed or prior confirmation has no source snapshot. Re-review required; saved details retained.'
-            saved['ready'] = bool(not saved['source_changed'] and saved['confirmed'] and valid_isbn(saved['isbn']) and genuine_date(saved['completed_date']) and saved['title'] and saved['author'])
+            saved['ready'] = bool(not saved['source_changed'] and saved['confirmed'] and valid_identifier(saved['isbn']) and genuine_date(saved['completed_date']) and safe_export_text(saved['title']) and safe_export_text(saved['author']))
             saved['automatic'] = bool(context.get('automatic'))
+            saved['saved_decision'] = bool(match)
             persisted = attempts.get((b['id'], saved['source_snapshot']))
             evidence = persisted or json.loads(context.get('evidence') or '{}')
             saved['score'] = evidence.get('score', 0)
@@ -342,6 +382,13 @@ class Goodreads:
                 saved['reason'] = suggestion['reason']
                 saved['provenance'] = suggestion.get('provenance') or 'Automatic catalog check'
                 saved['suggestion'] = suggestion.get('candidate')
+            saved['identifier_kind'] = 'ISBN' if valid_isbn(saved['isbn']) else 'ASIN' if valid_asin(saved['isbn']) else 'Invalid identifier'
+            if valid_asin(saved['isbn']) and saved['isbn'] == b['asin']:
+                saved['provenance'] = 'ABS-supplied ASIN from your audiobook edition (Goodreads acceptance unverified)'
+                saved['reason'] += ' Identifier is the ASIN of your audiobook edition, not a catalog ISBN.'
+            elif saved['identifier_kind'] == 'ASIN':
+                saved['provenance'] = 'User-reviewed ASIN (Goodreads acceptance unverified)'
+                saved['reason'] += ' Identifier is an ASIN, not a catalog ISBN.'
             books.append(saved)
         return {'books': books, 'excluded': excluded, 'batches': batches, 'match_job': self.match_job()}
 
@@ -451,9 +498,9 @@ class Goodreads:
         title, author = p.get('title', '').strip(), p.get('author', '').strip()
         if not title or not author or max(len(title), len(author)) > 1000 or title[0] in '=+-@' or author[0] in '=+-@':
             raise AppError('Enter the correct title and author(s) (up to 1,000 characters each).')
-        code = str(p.get('isbn', '')).strip()
-        if code and not valid_isbn(code):
-            raise AppError('That ISBN has an invalid format or checksum. Use 10 or 13 digits, preserving leading zeros.')
+        code = p.get('isbn', '')
+        if code and not valid_identifier(code):
+            raise AppError('Use a checksum-valid ISBN-10/13 or an ASIN of exactly 10 uppercase alphanumeric characters without whitespace.')
         rating = p.get('public_rating')
         if rating is not None and (type(rating) is not int or rating not in range(1, 6)):
             raise AppError('Choose a Goodreads rating from 1 to 5, or leave it blank.')
@@ -476,11 +523,11 @@ class Goodreads:
                 title=excluded.title,author=excluded.author,isbn=excluded.isbn,url=excluded.url,gr_id=excluded.gr_id,
                 confirmed=excluded.confirmed,public_rating=excluded.public_rating,completed_date=excluded.completed_date,
                 ignored=excluded.ignored,updated_at=excluded.updated_at''',
-                 (p['book_id'], title, author, valid_isbn(code), url, gr_id, int(bool(p.get('confirmed'))), rating, date, int(bool(p.get('ignored'))), now()))
+                  (p['book_id'], title, author, valid_identifier(code), url, gr_id, int(bool(p.get('confirmed'))), rating, date, int(bool(p.get('ignored'))), now()))
             db.execute('''INSERT INTO gr_match_context VALUES (?,?,?,?,?,0) ON CONFLICT(book_id) DO UPDATE SET
                 source_snapshot=excluded.source_snapshot,provenance=excluded.provenance,reason=excluded.reason,evidence=excluded.evidence,automatic=0''',
                 (p['book_id'], source_snapshot(dict(source)), 'Manual review (Goodreads acceptance unverified)',
-                 'User-reviewed work, authors, language, ISBN and actual completion date.', '{}'))
+                  'User-reviewed work, authors, language, identifier and actual completion date. Goodreads acceptance unverified.', '{}'))
         return {'saved': True}
 
     def resolve(self, p):
@@ -489,6 +536,10 @@ class Goodreads:
         ids = p.get('book_ids')
         if not isinstance(ids, list) or not 1 <= len(ids) <= 10 or any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids):
             raise AppError('Choose 1–10 distinct completed books for this explicit action.')
+        edited = 'title' in p or 'author' in p
+        if edited and (len(ids) != 1 or p.get('_batch_snapshot')):
+            raise AppError('Edited search details are only allowed for a single explicit lookup.')
+        query = {'title': search_text(p.get('title')), 'author': search_text(p.get('author'))} if edited else None
         results = []
         for book_id in ids:
             with self.store.lock:
@@ -503,9 +554,16 @@ class Goodreads:
                     results.append({'id': book_id, 'automatic': False, 'skipped': True,
                                     'reason': 'Skipped: source or saved decision changed before lookup.'})
                     continue
-            result = self.catalog.resolve(source)
+            if p.get('source_snapshot') and p['source_snapshot'] != source_snapshot(source):
+                raise AppError('Source changed while this form was open. Reload and re-review.')
+            if valid_asin(source.get('asin')) and not edited:
+                result = {'high_confidence': True, 'candidate': {'title': source['title'], 'author': source['author'], 'isbn': source['asin']},
+                          'provenance': 'ABS-supplied ASIN from your audiobook edition (Goodreads acceptance unverified)',
+                          'reason': 'Using the ASIN from your audiobook edition, not a catalog ISBN. Goodreads acceptance unverified.'}
+            else:
+                result = self.catalog.resolve(source | query if query else source)
             # Saved/manual/failed/stale decisions are never overwritten by automation.
-            automatic = bool(result['high_confidence'] and not prior and not eligible[book_id]['failure']
+            automatic = bool(result['high_confidence'] and not edited and not prior and not eligible[book_id]['failure']
                              and genuine_date(eligible[book_id]['completed_date']))
             with self.store.lock, self.store.db() as db:
                 current = dict(db.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
@@ -520,7 +578,7 @@ class Goodreads:
                 if candidate:
                     prior_reads = [dict(r) for r in db.execute("SELECT title,author,isbn FROM history WHERE shelf='read' OR date_read<>'' OR read_count>0")]
                     prior_exports = [dict(r) for r in db.execute("SELECT title,author,isbn FROM gr_export_items WHERE state IN ('exported','imported')")]
-                    if any(work_identity(candidate) == work_identity(r) or canonical_isbn(candidate['isbn']) == canonical_isbn(r['isbn'])
+                    if any(work_identity(candidate) == work_identity(r) or canonical_identifier(candidate['isbn']) == canonical_identifier(r['isbn'])
                            for r in prior_reads + prior_exports):
                         automatic = False
                         result = result | {'high_confidence': False, 'skipped': True,
@@ -591,7 +649,7 @@ class Goodreads:
         with self.store.lock:
             eligible = {b['id']: b for b in self.review()['books']}
             if any(i not in eligible or not eligible[i]['ready'] for i in ids):
-                raise AppError('Save and confirm each selected match, ISBN and completion date before exporting. Already exported books are excluded.')
+                raise AppError('Save and confirm each selected match, identifier and completion date before exporting. Already exported books are excluded.')
             output = io.StringIO(newline='')
             writer = csv.writer(output, lineterminator='\r\n')
             writer.writerow(HEADERS)

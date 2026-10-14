@@ -198,6 +198,8 @@ class Store:
             columns = {r[1] for r in db.execute('PRAGMA table_info(feedback)')}
             if 'language' not in {r[1] for r in db.execute('PRAGMA table_info(books)')}:
                 db.execute("ALTER TABLE books ADD COLUMN language TEXT NOT NULL DEFAULT ''")
+            if 'asin' not in {r[1] for r in db.execute('PRAGMA table_info(books)')}:
+                db.execute("ALTER TABLE books ADD COLUMN asin TEXT NOT NULL DEFAULT ''")
             if 'scope' not in columns:
                 db.execute("ALTER TABLE feedback ADD COLUMN scope TEXT NOT NULL DEFAULT 'lasting'")
             if 'kick_context' not in columns:
@@ -322,7 +324,7 @@ class Store:
                     available = bool(audio and not item.get('isMissing') and not item.get('isInvalid'))
                     incoming.append((item['id'], lib['id'], title, author, isbn(meta.get('isbn')), plain(meta.get('description')),
                                      json.dumps(meta.get('genres') or []), json.dumps(media.get('tags') or []), media.get('duration') or 0,
-                                     meta.get('narratorName') or '', int(available), identity(title, author)[0], canonical_author(author, known_authors), str(meta.get('language') or '')))
+                                     meta.get('narratorName') or '', int(available), identity(title, author)[0], canonical_author(author, known_authors), str(meta.get('language') or ''), meta.get('asin') if isinstance(meta.get('asin'), str) and meta.get('asin').strip() else ''))
             progress = me.get('mediaProgress')
             if progress is None:
                 progress = self.abs.get('/api/me/progress').get('mediaProgress')
@@ -332,11 +334,12 @@ class Store:
                 # All network reads finish before changing the snapshot.
                 db.execute('UPDATE books SET available=0')
                 db.executemany('''INSERT INTO books
-                  (id,library_id,title,author,isbn,description,genres,tags,duration,narrator,available,title_key,author_key,language)
-                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                  (id,library_id,title,author,isbn,description,genres,tags,duration,narrator,available,title_key,author_key,language,asin)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
                   library_id=excluded.library_id,title=excluded.title,author=excluded.author,isbn=excluded.isbn,
                   description=excluded.description,genres=excluded.genres,tags=excluded.tags,duration=excluded.duration,
-                  narrator=excluded.narrator,available=excluded.available,title_key=excluded.title_key,author_key=excluded.author_key,language=excluded.language''', incoming)
+                  narrator=excluded.narrator,available=excluded.available,title_key=excluded.title_key,author_key=excluded.author_key,language=excluded.language,
+                  asin=CASE WHEN excluded.asin<>'' THEN excluded.asin ELSE books.asin END''', incoming)
                 db.execute('UPDATE books SET progress=0,finished=0,finished_at=NULL')
                 for entry in progress:
                     if entry.get('episodeId') or not entry.get('libraryItemId'):

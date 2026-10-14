@@ -102,7 +102,7 @@ async function loadGoodreads(automatic = true) {
     const detail = el('details'), summary = el('summary', '', 'Review book & public rating'), form = el('form', 'gr-form');
     if (book.suggestion) card.append(el('p', 'muted', `Saved catalog suggestion (unconfirmed): ${book.suggestion.title} — ${book.suggestion.author} · ${book.suggestion.isbn}. Use Find work ISBN or copy these details for review.`));
     for (const candidate of (book.candidates || []).slice(0, 10)) card.append(el('p', 'muted', `Catalog evidence (not a confirmed match): ${candidate.title} — ${candidate.author} · ${(candidate.isbns || []).join(', ')}`));
-    form.append(field('Goodreads title', 'title', book.title), field('Author(s) — review roles; do not drop coauthors', 'author', book.author), field('ISBN — catalog listing does not guarantee Goodreads acceptance', 'isbn', book.isbn), field('Goodreads book link', 'url', book.url, 'url'), field('Date completed — exported as Date Read', 'completed_date', book.completed_date, 'date'));
+    form.append(field('Goodreads title', 'title', book.title), field('Author(s) — review roles; do not drop coauthors', 'author', book.author), field('Identifier — audiobook ASIN or catalog ISBN; Goodreads acceptance unverified', 'isbn', book.isbn), field('Goodreads book link', 'url', book.url, 'url'), field('Date completed — exported as Date Read', 'completed_date', book.completed_date, 'date'));
     const ratingLabel = el('label', '', 'Public Goodreads stars'), rating = el('select'); rating.name = 'public_rating';
     for (const [value, text] of [['', 'Leave unrated'], ['1', '★'], ['2', '★★'], ['3', '★★★'], ['4', '★★★★'], ['5', '★★★★★']]) { const option = el('option', '', text); option.value = value; rating.append(option); } rating.value = book.public_rating ?? ''; ratingLabel.append(rating); form.append(ratingLabel, el('p', 'muted', 'These stars are only for Goodreads. Your private rating, notes and recommendations stay separate.'));
     const confirmLabel = el('label', 'check'), confirmed = el('input'); confirmed.type = 'checkbox'; confirmed.name = 'confirmed'; confirmed.checked = Boolean(book.confirmed && !book.source_changed); confirmLabel.append(confirmed, el('span', '', 'I checked the work and full author set. A print, Kindle, large-print or translated edition may represent the audiobook; ISBN checksum alone is not a match.')); form.append(confirmLabel);
@@ -123,13 +123,18 @@ async function loadGoodreads(automatic = true) {
     const lookup = el('button', 'secondary', 'Get ISBN from link'), save = el('button', '', 'Save export details'), ignore = el('button', 'secondary', 'Skip this book'); lookup.type = ignore.type = 'button'; save.type = 'submit';
     const resolve = el('button', 'secondary', 'Find work ISBN (free catalogs)'); resolve.type = 'button';
     resolve.addEventListener('click', () => lookupAction(resolve, async () => {
-      const response = await api('/api/goodreads/resolve', {book_ids: [book.id]}), result = response.results[0];
-      if (result.automatic) {await loadGoodreads(); message(result.provenance + ': ' + result.reason); return;}
+      const response = await api('/api/goodreads/resolve', {book_ids: [book.id], title: form.elements.title.value, author: form.elements.author.value, source_snapshot: book.source_snapshot}), result = response.results[0];
+      // Explicit lookups are suggestions, never a reload that discards any form.
       if (result.candidate) {
-        form.elements.title.value = result.candidate.title; form.elements.author.value = result.candidate.author; form.elements.isbn.value = result.candidate.isbn; updateIsbnLink();
+        status.textContent = `Suggestion: ${result.candidate.title} — ${result.candidate.author} · catalog ISBN ${result.candidate.isbn}. Existing edits retained. `;
+        if (!grDirty && !book.saved_decision && !book.confirmed) {
+          form.elements.title.value = result.candidate.title; form.elements.author.value = result.candidate.author;
+          if (book.isbn !== book.audio_asin && (!/^[A-Z0-9]{10}$/.test(book.isbn || '') || canonicalIsbn(book.isbn))) form.elements.isbn.value = result.candidate.isbn;
+          grDirty = true; updateIsbnLink();
+        }
         confirmed.checked = false; check.disabled = true; check.checked = false; grSelected.delete(book.id); grCount();
       }
-      status.textContent = (result.provenance || 'Catalog lookup') + ': ' + result.reason;
+      status.textContent += (result.provenance || 'Catalog lookup') + ': ' + result.reason;
       message(result.reason);
     }));
     lookup.addEventListener('click', () => lookupAction(lookup, async () => {

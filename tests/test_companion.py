@@ -260,17 +260,19 @@ class ReceiverHTTPTests(test_http.HTTPTests):
             self.assertEqual(request.call_count, 1)
             self.assertNotIn('PRIVATE', str(request.call_args_list))
 
-    def test_catalog_resolution_api_uses_source_metadata_not_client_search_or_private_feedback(self):
+    def test_explicit_resolution_uses_edited_search_but_not_private_fields(self):
         from test_isbn_catalog import GOOGLE
         with self.store.db() as db:
             db.execute("UPDATE books SET finished=1,finished_at='2026-10-01',language='English' WHERE id='one'")
         with patch('isbn_catalog.Catalog.request', return_value=GOOGLE) as request:
             status, _, body = self.request('/api/goodreads/resolve',
-                {'book_ids': ['one'], 'title': 'Client private text', 'url': 'http://localhost/private'},
+                {'book_ids': ['one'], 'title': 'Edited public title', 'author': 'Edited public author', 'url': 'http://localhost/private', 'narrator': 'PRIVATE narrator', 'notes': 'PRIVATE feedback'},
                 {'X-Selector-Request': '1'})
         self.assertEqual(status, 200)
-        self.assertTrue(json.loads(body)['results'][0]['automatic'])
+        self.assertFalse(json.loads(body)['results'][0]['automatic'])
+        self.assertIn('Edited', str(request.call_args_list))
         self.assertNotIn('private', str(request.call_args_list))
+        self.assertNotIn('PRIVATE', str(request.call_args_list))
 
     def test_auto_resolution_api_ignores_client_metadata_and_has_no_get_side_effect(self):
         from test_isbn_catalog import GOOGLE

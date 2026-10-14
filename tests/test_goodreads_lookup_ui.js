@@ -19,7 +19,7 @@ async function main() {
   const $ = selector => {if (!nodes.has(selector)) nodes.set(selector, new Element('div')); return nodes.get(selector);};
   for (const name of ['output', 'confirm_remaining']) {const n = new Element('input'); n.name = name; $('#gr-reconcile-form').append(n);}
   const book = {id: 'synthetic', title: 'One', original_title: 'One', author: 'Writer', original_author: 'Writer', isbn: '', url: '', completed_date: '2026-10-01', reason: 'Review', provenance: 'Source', ready: false};
-  let automatic = false, hold;
+   let automatic = false, hold, suggestion = false;
   const context = vm.createContext({console, Set, Date, Intl, encodeURIComponent, document: {querySelectorAll: () => []}, location: {hash: ''},
     $, el: (...args) => new Element(...args), message: (...args) => messages.push(args),
     action: async (button, fn) => {try {await fn();} catch (e) {messages.push([e.message, true]);}},
@@ -27,7 +27,10 @@ async function main() {
       calls.push([path, payload]);
       if (path === '/api/goodreads') return {books: [{...book, ready: automatic}], excluded: 0, batches: []};
       if (path === '/api/goodreads/auto-resolve') {if (hold) await hold; automatic = true; return {results: [{automatic: true}]};}
-      if (path === '/api/goodreads/resolve') throw new Error('Public catalog unavailable; review manually.');
+       if (path === '/api/goodreads/resolve') {
+         if (suggestion) return {results: [{automatic: false, candidate: {title: 'Catalog title', author: 'Catalog author', isbn: '9780306406157'}, reason: 'Synthetic suggestion', provenance: 'Catalog'}]};
+         throw new Error('Public catalog unavailable; review manually.');
+       }
       throw new Error('Unexpected API ' + path);
     }});
   const source = fs.readFileSync('static/companion.js', 'utf8');
@@ -59,7 +62,19 @@ async function main() {
   assert.ok(printSearch.href.startsWith('https://www.google.com/search?q='));
   const queryPart = link => link.href.slice(link.href.indexOf('?q=') + 3);
   // Hostile title/author input (spaces, &, +, quotes, formula triggers) stays percent-encoded.
-  const form = card.all().find(n => n.className === 'gr-form');
+   const form = card.all().find(n => n.className === 'gr-form');
+   suggestion = true;
+   form.elements.title.value = 'Edited public title'; form.elements.author.value = 'Edited public author';
+   form.elements.isbn.value = 'B0CHYSM5M4';
+   await card.all().find(n => n.textContent === 'Find work ISBN (free catalogs)').listeners.click[0]();
+   const explicit = calls.filter(c => c[0].endsWith('/resolve')).at(-1)[1];
+   assert.equal(explicit.title, 'Edited public title'); assert.equal(explicit.author, 'Edited public author');
+   assert.equal(form.elements.title.value, 'Edited public title', 'lookup retains unsaved title');
+   assert.equal(form.elements.author.value, 'Edited public author', 'lookup retains unsaved author');
+   assert.equal(form.elements.isbn.value, 'B0CHYSM5M4', 'catalog suggestion does not replace unsaved ASIN');
+   assert.equal($('#gr-books').children[0], card, 'explicit lookup never reloads unsaved forms');
+   assert.ok(card.all().some(n => n.textContent.includes('catalog ISBN 9780306406157')));
+   form.elements.isbn.value = '';
   form.elements.title.value = '=cmd|calc "Cleat Cute" +2';
   form.elements.author.value = 'Amy + "Bob" & Co @x';
   for (const fn of search.listeners.click) fn();
@@ -92,7 +107,12 @@ async function main() {
   const status = card.all().find(n => n.tag === 'p' && n.textContent.includes('daily_quota'));
   assert.match(status.textContent, /Lookup could not run; export stays blocked/);
   assert.doesNotMatch(status.textContent, /Review required/);
-  assert.ok(card.all().find(n => n.textContent === 'Retry provider-blocked books (up to 25)'));
-  console.log('Goodreads UI synthetic checks passed');
+   assert.ok(card.all().find(n => n.textContent === 'Retry provider-blocked books (up to 25)'));
+   book.saved_decision = true; book.confirmed = false; book.isbn = '9798217058785';
+   await context.loadGoodreads(false);
+   card = $('#gr-books').children[0];
+   await card.all().find(n => n.textContent === 'Find work ISBN (free catalogs)').listeners.click[0]();
+   assert.equal(card.all().find(n => n.name === 'isbn').value, '9798217058785', 'catalog lookup retains even an unconfirmed user-saved reviewed ISBN');
+   console.log('Goodreads UI synthetic checks passed');
 }
 main().catch(error => {console.error(error); process.exitCode = 1;});
