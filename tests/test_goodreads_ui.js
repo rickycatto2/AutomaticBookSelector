@@ -19,15 +19,20 @@ const form = $('#gr-reconcile-form'), button = $('#gr-reconcile-form [type=submi
 form.elements = {output: new Element(), confirm_remaining: new Element()};
 $('#gr-batch').value = 'synthetic-batch';
 const calls = [], messages = [];
-let ambiguous = false, reloads = 0, noFailures = false;
+let ambiguous = false, reloads = 0, noFailures = false, failTitle = '', extraItems = [];
 const context = vm.createContext({$, grBooks: [{id: 'skip', skipped: true}], el: (tag, cls, text) => Object.assign(new Element(tag), {textContent: text}),
-  action: (button, callback) => callback(), message: text => messages.push(text),
+  action: async (button, callback) => {
+    if (button.disabled) return;
+    button.disabled = true;
+    try {await callback();} catch (error) {messages.push(error.message);} finally {button.disabled = false;}
+  }, message: text => messages.push(text),
   loadGoodreads: async () => {reloads++;},
   api: async (path, payload) => {
     calls.push({path, payload});
+    if (path === '/api/goodreads/confirm-imported' && payload.book_id === failTitle) throw new Error('Synthetic stale title');
     return {items: [{id: 'one', title: '<script>synthetic</script>', author: 'Writer', isbn: '9780306406157',
       state: 'exported', proposed_failed: !noFailures && (!ambiguous || Boolean(payload.failed_ids?.length))},
-      {id: 'two', title: 'Two', state: 'exported'}, {id: 'skip', title: 'Skipped', state: 'exported'}],
+      {id: 'two', title: 'Two', state: 'exported'}, {id: 'skip', title: 'Skipped', state: 'exported'}, ...extraItems],
       flagged: ['One'], mixed: true, ambiguous: ambiguous && !payload.failed_ids?.length,
        unrecognized: noFailures && payload.text === 'unknown', no_op: noFailures && !payload.text, can_confirm_remaining: !ambiguous};
   }});
@@ -97,5 +102,27 @@ const settle = async () => {await new Promise(resolve => setImmediate(resolve));
    await $('#gr-clear-imports').listeners.click();
    assert.equal(button.textContent, 'Finish this batch: clear imports, keep failures');
    assert.ok(messages.at(-1).includes('cannot clear'));
-  console.log('Goodreads synthetic preview/selection/save UI checks passed');
+   // Both non-atomic paths report only completed requests, retain the server
+   // error, reload reality, and consume the plan before any asynchronous work.
+   for (const clearDirectly of [true, false]) {
+     noFailures = clearDirectly;
+     extraItems = [{id: 'three', title: 'Three', state: 'exported'}, {id: 'four', title: 'Four', state: 'exported'}];
+     failTitle = clearDirectly ? 'two' : 'three';
+     form.elements.output.value = clearDirectly ? '' : 'synthetic mixed report';
+     form.elements.output.listeners.input();
+     form.elements.confirm_remaining.checked = true;
+     if (clearDirectly) await $('#gr-clear-imports').listeners.click();
+     else {submit(); await settle();}
+     const beforeReloads = reloads, beforeCalls = calls.length;
+     submit();
+     assert.equal(button.disabled, true);
+     assert.equal(vm.runInContext('grPendingPlan === null && grClearItems === null', context), true);
+     submit(); // disabled apply button cannot run the same plan twice
+     await settle();
+     assert.equal(reloads, beforeReloads + 1);
+     assert.equal(messages.at(-1), `Confirmed 1 of ${clearDirectly ? 4 : 3} before the failure; the rest are still in your queue. Review and repeat. Synthetic stale title`);
+     assert.deepEqual(calls.slice(beforeCalls).filter(c => c.path === '/api/goodreads/confirm-imported').map(c => c.payload.book_id), clearDirectly ? ['one', 'two'] : ['two', 'three']);
+     assert.equal(button.disabled, false);
+   }
+   console.log('Goodreads synthetic preview/selection/save UI checks passed');
 })().catch(error => {console.error(error); process.exitCode = 1;});
