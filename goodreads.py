@@ -504,6 +504,25 @@ class Goodreads:
                            (book_id, row['source_snapshot'], json.dumps(result)))
         return {'results': [result], 'job': self.match_job(job_id)}
 
+    def set_skipped(self, p):
+        """Toggle only the reversible Goodreads flag; retain decisions and history."""
+        if type(p.get('ignored')) is not bool:
+            raise AppError('Skip flag must be a boolean value.')
+        with self.store.lock, self.store.db() as db:
+            book = next((b for b in self.review()['books'] if b['id'] == p.get('book_id')), None)
+            if not book:
+                raise AppError('Only completed review entries can be skipped or restored.')
+            if p.get('source_snapshot') and p['source_snapshot'] != book['source_snapshot']:
+                raise AppError('Source changed while this form was open. Reload and re-review.')
+            # A first skip stores the displayed source details without confirming
+            # them. Subsequent toggles must not rewrite any saved field/context.
+            db.execute('INSERT OR IGNORE INTO gr_matches VALUES (?,?,?,?,?,?,0,?,?,0,?)',
+                       (book['id'], book['title'], book['author'], book['isbn'], book['url'],
+                        book.get('gr_id', ''), book['public_rating'], book['completed_date'], now()))
+            db.execute('UPDATE gr_matches SET ignored=?,updated_at=? WHERE book_id=?',
+                       (int(p['ignored']), now(), book['id']))
+        return {'skipped': p['ignored']}
+
     def save(self, p):
         if any(k in p and type(p[k]) is not bool for k in ('confirmed', 'ignored')):
             raise AppError('Match confirmation and skip flags must be boolean values.')
@@ -560,6 +579,10 @@ class Goodreads:
                 eligible = {b['id']: b for b in self.review()['books']}
                 if book_id not in eligible:
                     raise AppError('Only completed, not-yet-confirmed-imported review entries can be resolved.')
+                if eligible[book_id]['skipped']:
+                    results.append({'id': book_id, 'automatic': False, 'skipped': True,
+                                    'reason': 'Skipped: restore to queue before catalog matching.'})
+                    continue
                 with self.store.db() as db:
                     source = dict(db.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
                     prior = db.execute('SELECT 1 FROM gr_matches WHERE book_id=?', (book_id,)).fetchone()

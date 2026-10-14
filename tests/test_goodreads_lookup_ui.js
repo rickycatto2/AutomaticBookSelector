@@ -25,7 +25,8 @@ async function main() {
     action: async (button, fn) => {try {await fn();} catch (e) {messages.push([e.message, true]);}},
     api: async (path, payload) => {
       calls.push([path, payload]);
-      if (path === '/api/goodreads') return {books: [{...book, ready: automatic}], excluded: 0, batches: []};
+      if (path === '/api/goodreads') return {books: [{...book, ready: automatic && !book.skipped}], excluded: 0, batches: []};
+      if (path === '/api/goodreads/skip') {book.skipped = payload.ignored; return {skipped: book.skipped};}
       if (path === '/api/goodreads/auto-resolve') {if (hold) await hold; automatic = true; return {results: [{automatic: true}]};}
        if (path === '/api/goodreads/resolve') {
          if (suggestion) return {results: [{automatic: false, candidate: {title: 'Catalog title', author: 'Catalog author', isbn: '9780306406157'}, reason: 'Synthetic suggestion', provenance: 'Catalog'}]};
@@ -109,10 +110,10 @@ async function main() {
      }
    }
    assert.ok(card.all().some(n => n.textContent === 'Skip this book'));
-   assert.ok(card.all().some(n => /excluded from exports and Goodreads suggestions until you Save again/.test(n.textContent)));
+    assert.ok(card.all().some(n => /excluded from exports and Goodreads suggestions until you Restore to queue/.test(n.textContent)));
    const html = fs.readFileSync('static/index.html', 'utf8');
    const help = html.match(/<aside id="gr-queue-help"[\s\S]*?<\/aside>/)[0];
-   for (const text of ['How to clear your queue', 'rejection output', 'I checked that the other books in this batch imported successfully', 'still-exported', 'ambiguity', 'Confirm imported', 'Skip this book', 'Save again', 'free catalogs', 'ABS-supplied ASIN', 'not Goodreads', 'read the exact counts', 'confirm the plan']) assert.ok(help.includes(text), text);
+    for (const text of ['How to clear your queue', 'rejection output', 'I checked that the other books in this batch imported successfully', 'still-exported', 'ambiguity', 'Confirm imported', 'Skip this book', 'Restore to queue', 'hidden from the queue', 'still inform your recommendations', 'never export to Goodreads', 'free catalogs', 'ABS-supplied ASIN', 'not Goodreads', 'read the exact counts', 'confirm the plan']) assert.ok(help.includes(text), text);
    assert.doesNotMatch(html + source, /clear[-_ ](?:everything|all|queue)|bulk[-_ ]clear/i);
   // ISBN direct link only appears for a checksum-valid ISBN, never asserting recognition.
   const isbnLink = card.all().find(n => n.textContent === 'Open Goodreads edition for this ISBN');
@@ -132,7 +133,16 @@ async function main() {
   book.reason = 'Google Books [daily_quota]: Daily quota exceeded (HTTP 429).';
   await context.loadGoodreads(false);
   card = $('#gr-books').children[0];
-   assert.match(card.all().find(n => n.className === 'gr-state').textContent, /Skipped: excluded from exports and Goodreads suggestions\. Save again to resume/);
+    assert.equal(card.className, 'empty', 'skipped-only queue has no working card');
+    assert.equal($('#gr-skipped-summary').textContent, 'Skipped (1)');
+    assert.ok($('#gr-skipped-list').all().some(n => n.textContent === 'One — Writer'));
+    automatic = true;
+    await $('#gr-skipped-list').all().find(n => n.textContent === 'Restore to queue').listeners.click[0]();
+    assert.equal(book.skipped, false);
+    assert.equal($('#gr-skipped-summary').textContent, 'Skipped (0)');
+    card = $('#gr-books').children[0];
+    assert.equal(card.all().find(n => n.tag === 'input' && n.type === 'checkbox').disabled, false, 'restore re-enables ready export');
+    automatic = false; await context.loadGoodreads(false); card = $('#gr-books').children[0];
    const status = card.all().find(n => n.tag === 'p' && n.textContent.includes('daily_quota'));
   assert.match(status.textContent, /Lookup could not run; export stays blocked/);
   assert.doesNotMatch(status.textContent, /Review required/);

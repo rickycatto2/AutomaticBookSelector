@@ -77,16 +77,27 @@ async function loadGoodreads(automatic = false) {
   const ticket = ++grTicket, result = await api('/api/goodreads'); if (ticket !== grTicket) return;
   grBooks = result.books; resetImportPreview(); grSelected = new Set([...grSelected].filter(id => grBooks.some(b => b.id === id && b.ready)));
   grMatchJob = result.match_job || null; grDirty = false; grMatchProgress();
-  $('#gr-books').replaceChildren(); $('#gr-summary').textContent = `${result.books.length} completed books not confirmed imported · ${result.books.filter(b => b.ready).length} saved and ready. ${result.excluded} confirmed/read-history entries excluded. Exporting does not clear the queue: confirm imported books in Export history. Skip books you do not want on Goodreads instead of exporting and re-uploading them.`;
-  if (!result.books.length) $('#gr-books').append(el('div', 'empty', 'All caught up. New completions will appear here.'));
-  for (const book of result.books) {
+  const queue = grBooks.filter(b => !b.skipped), skipped = grBooks.filter(b => b.skipped);
+  $('#gr-skipped-list').replaceChildren(); $('#gr-skipped-summary').textContent = `Skipped (${skipped.length})`;
+  for (const book of skipped) {
+    const row = el('div', 'batch-title'), restore = el('button', 'secondary', 'Restore to queue'); restore.type = 'button';
+    restore.setAttribute('aria-label', 'Restore to queue: ' + book.title);
+    restore.addEventListener('click', () => action(restore, async () => {
+      await api('/api/goodreads/skip', {book_id: book.id, ignored: false}); await loadGoodreads();
+      message('Restored to queue. Saved details and export history retained; review and Save if needed.');
+    }));
+    row.append(el('span', '', `${book.title} — ${book.author}`), restore); $('#gr-skipped-list').append(row);
+  }
+  $('#gr-books').replaceChildren(); $('#gr-summary').textContent = `${queue.length} completed books in queue · ${queue.filter(b => b.ready).length} saved and ready · ${skipped.length} skipped (hidden, recoverable below). ${result.excluded} confirmed/read-history entries excluded. Exporting does not clear the queue: confirm imported books in Export history. Skip books you never want on Goodreads.`;
+  if (!queue.length) $('#gr-books').append(el('div', 'empty', 'All caught up. New completions will appear here.'));
+  for (const book of queue) {
     const card = el('article', 'paper gr-book'), heading = el('div', 'gr-heading'), checkLabel = el('label', 'check'), check = el('input'); check.type = 'checkbox'; check.disabled = !book.ready; check.checked = grSelected.has(book.id); check.setAttribute('aria-label', 'Export ' + book.title);
     check.addEventListener('change', () => {check.checked ? grSelected.add(book.id) : grSelected.delete(book.id); grCount();});
     const cover = el('img', 'gr-cover'); cover.src = '/api/cover?id=' + encodeURIComponent(book.id); cover.alt = 'Cover of ' + book.title; cover.loading = 'lazy'; cover.addEventListener('error', () => {cover.hidden = true;});
     checkLabel.append(check, el('span', '', book.title)); heading.append(cover, checkLabel);
     const status = el('p', 'muted', (book.ready ? 'Ready to export. ' : book.provider_error ? 'Lookup could not run; export stays blocked. ' : 'Review required. ') + book.provenance + ': ' + (book.lookup_status || book.reason)); card.append(heading, el('p', 'muted', book.author), status);
     if (book.original_author !== book.author) card.append(el('p', 'muted', 'ABS author metadata: ' + book.original_author));
-    card.append(el('p', 'gr-state', `${book.import_state || 'never-attempted'}${book.skipped ? ' · Skipped: excluded from exports and Goodreads suggestions. Save again to resume.' : ''}`));
+    card.append(el('p', 'gr-state', book.import_state || 'never-attempted'));
     if (book.retry_eligible) {
       const retry = el('button', 'secondary', 'Retry provider-blocked books (up to 25)'); retry.type = 'button';
       retry.addEventListener('click', () => matchEligibleBooks(true)); card.append(retry);
@@ -161,8 +172,8 @@ async function loadGoodreads(automatic = false) {
       if (!canonicalIsbn(payload.isbn) && !/^[A-Z0-9]{10}$/.test(payload.isbn)) throw new Error('Enter a checksum-valid ISBN-10/13 or an ASIN of exactly 10 uppercase alphanumeric characters.');
       await api('/api/goodreads/save', payload); grSelected.add(book.id); await loadGoodreads(); message('Saved for export. Your private review is unchanged.');
     });});
-    ignore.addEventListener('click', () => action(ignore, async () => {await api('/api/goodreads/save', {...grPayload(form, book), confirmed: false, ignored: true}); grSelected.delete(book.id); await loadGoodreads(); message('Skipped: excluded from exports and Goodreads suggestions. Its details remain here; Save again to resume.');}));
-    actions.append(search, save, ignore); extras.append(resolve, printSearch, isbnLink, lookup); form.append(actions, el('p', 'muted', 'Skip this book if you never want it on Goodreads: excluded from exports and Goodreads suggestions until you Save again.'), detail); card.append(form); $('#gr-books').append(card);
+    ignore.addEventListener('click', () => action(ignore, async () => {await api('/api/goodreads/skip', {book_id: book.id, source_snapshot: book.source_snapshot, ignored: true}); grSelected.delete(book.id); await loadGoodreads(); message('Skipped and hidden from queue. Restore to queue in Skipped; saved details and history retained. Unsaved edits were not saved.');}));
+    actions.append(search, save, ignore); extras.append(resolve, printSearch, isbnLink, lookup); form.append(actions, el('p', 'muted', 'Skip this book if you never want it on Goodreads: hidden and excluded from exports and Goodreads suggestions until you Restore to queue. Saved details are retained; unsaved edits are not saved.'), detail); card.append(form); $('#gr-books').append(card);
   }
   const previousBatch = $('#gr-batch').value;
   $('#gr-batches').replaceChildren(); $('#gr-batch').replaceChildren();

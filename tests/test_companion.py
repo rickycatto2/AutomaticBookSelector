@@ -44,6 +44,51 @@ class CompanionTests(unittest.TestCase):
         token = self.telemetry.create({'name': 'Test phone'})
         return token, self.telemetry.authenticate({'Authorization': 'Bearer ' + token['token']})
 
+    def test_skip_restore_is_flag_only_and_recommendations_are_isolated(self):
+        self.finish()
+        self.match()
+        self.store.feedback({'book_id': 'one', 'rating': 5, 'dnf': True, 'notes': 'Private'})
+        batch = self.gr.export(['one'])
+        tables = ('gr_matches', 'gr_match_context', 'gr_exports', 'gr_export_items', 'feedback', 'history')
+        def snapshot():
+            with self.store.db() as db:
+                return {t: [dict(r) for r in db.execute('SELECT * FROM ' + t)] for t in tables}
+        before = snapshot()
+        ranked = self.store._rank()  # fresh ranking, never a cached comparison
+        self.gr.set_skipped({'book_id': 'one', 'ignored': True})
+        book = self.gr.review()['books'][0]
+        self.assertTrue(book['skipped'])
+        self.assertFalse(book['ready'])
+        self.assertFalse(book['match_eligible'] or book['retry_eligible'] or book['recheck_eligible'])
+        self.assertEqual(self.store._rank(), ranked)
+        with self.assertRaises(AppError):
+            self.gr.export(['one'])
+        with patch.object(self.gr.catalog, 'resolve', side_effect=AssertionError('No lookup')):
+            self.assertTrue(self.gr.resolve({'book_ids': ['one']})['results'][0]['skipped'])
+            self.assertFalse(self.gr.start_match_batch()['job'])
+            self.assertFalse(self.gr.recheck_books()['job'])
+            self.assertFalse(self.gr.retry_provider_books()['job'])
+            self.assertFalse(self.gr.auto_resolve()['results'])
+        self.gr.set_skipped({'book_id': 'one', 'ignored': False})
+        self.assertTrue(self.gr.review()['books'][0]['ready'])
+        self.assertEqual(self.store._rank(), ranked)
+        after = snapshot()
+        for row in before['gr_matches'] + after['gr_matches']:
+            row.pop('updated_at')
+        self.assertEqual(after, before)
+        self.assertEqual(self.gr.batch(batch['id'])['csv'], batch['csv'])
+        self.assertEqual(self.gr.export(['one'])['count'], 1)
+
+    def test_first_skip_without_identifier_or_date_restores_for_review(self):
+        self.finish(when='')
+        self.gr.set_skipped({'book_id': 'one', 'ignored': True})
+        self.assertTrue(self.gr.review()['books'][0]['skipped'])
+        self.gr.set_skipped({'book_id': 'one', 'ignored': False})
+        self.assertFalse(self.gr.review()['books'][0]['ready'])
+        for payload in ({'book_id': 'one', 'ignored': 'false'}, {'book_id': 'missing', 'ignored': False}):
+            with self.assertRaises(AppError):
+                self.gr.set_skipped(payload)
+
     def test_export_has_completion_date_and_independent_public_rating(self):
         self.finish()
         self.store.feedback({'book_id': 'one', 'rating': 1, 'notes': 'Private note'})
@@ -259,6 +304,19 @@ class ReceiverHTTPTests(test_http.HTTPTests):
             self.request('/api/goodreads/resolve', {'book_ids': ['one'], 'batch_id': job['id']}, headers)
             self.assertEqual(request.call_count, 1)
             self.assertNotIn('PRIVATE', str(request.call_args_list))
+
+    def test_skip_restore_endpoint_retains_saved_details_and_requires_csrf(self):
+        with self.store.db() as db:
+            db.execute("UPDATE books SET finished=1,finished_at='2026-10-01' WHERE id='one'")
+        headers = {'X-Selector-Request': '1'}
+        payload = {'book_id': 'one', 'ignored': True}
+        self.assertEqual(self.request('/api/goodreads/skip', payload)[0], 403)
+        self.assertEqual(self.request('/api/goodreads/skip', payload, headers)[0], 200)
+        status, _, body = self.request('/api/goodreads')
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)['books'][0]['skipped'])
+        self.assertEqual(self.request('/api/goodreads/skip', payload | {'ignored': False}, headers)[0], 200)
+        self.assertFalse(json.loads(self.request('/api/goodreads')[2])['books'][0]['skipped'])
 
     def test_explicit_resolution_uses_edited_search_but_not_private_fields(self):
         from test_isbn_catalog import GOOGLE

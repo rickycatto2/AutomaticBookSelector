@@ -212,6 +212,8 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
                         result = store.feedback(payload)
                     elif self.path == '/api/goodreads/save':
                         result = goodreads.save(payload)
+                    elif self.path == '/api/goodreads/skip':
+                        result = goodreads.set_skipped(payload)
                     elif self.path == '/api/goodreads/lookup':
                         result = goodreads.lookup(payload)
                     elif self.path == '/api/goodreads/resolve':
