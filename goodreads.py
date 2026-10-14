@@ -23,7 +23,7 @@ LEGACY_CATALOG_BLOCK = 'Public catalog unavailable or response invalid; review m
 
 
 def import_report(text, items):
-    """Deliberately narrow grammar: exact ISBN or whole 'title by author' row.
+    """Deliberately narrow grammar: exact ISBN/ASIN or whole 'title by author' row.
 
     Unknown formats stay local for explicit selection; never infer failures from
     a title/author substring or from a success row in a mixed report.
@@ -51,6 +51,16 @@ def import_report(text, items):
         # Do not inherit failure context into arbitrary prose or success rows.
         cells = line.split('\t')
         table_row = bool(table and len(cells) == 3 and valid_identifier(cells[0].strip()))
+        if table and not table_row and '\t' not in line:
+            # Browser/plain-text copies can collapse the blank Title column to
+            # spaces. Token detection alone is not failure evidence: require
+            # the remaining cell to be the exact exported author, not prose.
+            row = re.fullmatch(r'(\S+)\s+(.+)', line)
+            if row and valid_identifier(row[1]) and any(
+                    canonical_identifier(b['isbn']) == canonical_identifier(row[1])
+                    and normalize(b['author']) == normalize(row[2]) for b in items):
+                cells = [row[1], '', row[2]]
+                table_row = True
         if table_row:
             table_rows += 1
         if clean in ('failed books', 'failed imports', 'errors', 'rejected books'):
@@ -76,7 +86,7 @@ def import_report(text, items):
             if not bare_code and not bare_work and not table_row:
                 status = ''
         codes = {canonical_isbn(valid_isbn(m.group())) for m in re.finditer(r'(?<![\w-])(?:\d[ -]?){9,}[\dXx](?![\w-])', line)} - {''}
-        codes.update(valid_asin(m.group()) for m in re.finditer(r'(?<![\w-])[A-Z0-9]{10}(?![\w-])', line))
+        codes.update(canonical_identifier(m.group()) for m in re.finditer(r'(?<![\w-])[A-Z0-9]{10}(?![\w-])', line))
         if table_row:
             codes = {canonical_identifier(cells[0].strip())}
         matches = [b for b in items if (valid_identifier(b['isbn']) and canonical_identifier(b['isbn']) in codes)
@@ -305,12 +315,12 @@ class Goodreads:
             seeds = {work_identity(h): h for h in history}
             matches = {r['book_id']: dict(r) for r in db.execute('SELECT * FROM gr_matches')}
             exported = [dict(r) for r in db.execute("""SELECT i.* FROM gr_export_items i
-                JOIN gr_exports e ON e.id=i.batch_id WHERE i.state IN ('exported','imported')
+                JOIN gr_exports e ON e.id=i.batch_id WHERE i.state='imported'
                 AND NOT EXISTS (SELECT 1 FROM gr_export_items newer JOIN gr_exports ne ON ne.id=newer.batch_id
                     WHERE newer.book_id=i.book_id AND ne.rowid>e.rowid)""")]
-            exports = {work_identity(r) for r in exported}
-            export_isbns = {canonical_identifier(r['isbn']) for r in exported} - {''}
             exported_ids = {r['book_id'] for r in exported}
+            latest_items = {r['book_id']: dict(r) for r in db.execute('''SELECT i.* FROM gr_export_items i
+                JOIN gr_exports e ON e.id=i.batch_id ORDER BY e.rowid,i.rowid''')}
             contexts = {r['book_id']: dict(r) for r in db.execute('SELECT * FROM gr_match_context')}
             attempts = {(r['book_id'], r['source_snapshot']): json.loads(r['result'])
                         for r in db.execute('SELECT * FROM gr_catalog_attempts')}
@@ -321,8 +331,8 @@ class Goodreads:
                 WHERE b.finished=1 OR b.id IN (SELECT abs_item_id FROM bookramp_sessions WHERE completion_crossed=1)''')]
             batches = [dict(r) for r in db.execute('''SELECT e.id,e.created_at,
                 count(i.book_id) AS count,sum(i.state='failed') AS failed,sum(i.state='imported') AS imported
-                FROM gr_exports e JOIN gr_export_items i ON i.batch_id=e.id GROUP BY e.id ORDER BY e.created_at DESC LIMIT 20''')]
-        seen, seen_identifiers, books, excluded = set(), set(), [], 0
+                FROM gr_exports e JOIN gr_export_items i ON i.batch_id=e.id GROUP BY e.id ORDER BY e.rowid DESC''')]
+        books, excluded = [], 0
         # Keep the actual rejected ABS ID visible ahead of duplicate editions.
         for b in sorted(rows, key=lambda b: (b['id'] in failures, str(b['finished_at'] or b['ramp_finished'] or '')), reverse=True):
             key = work_identity(b)
@@ -330,16 +340,20 @@ class Goodreads:
             identifiers = {canonical_identifier(b['isbn']), valid_asin(b['asin'])} - {''}
             if not valid_isbn(match.get('isbn')) and valid_asin(match.get('isbn')):
                 identifiers.add(valid_asin(match['isbn']))
-            if b['dnf'] or key in read_titles or key in exports or identifiers & (read_isbns | export_isbns | seen_identifiers) or b['id'] in exported_ids or key in seen or match.get('ignored'):
+            if b['id'] in exported_ids or (b['id'] not in latest_items and (key in read_titles or identifiers & read_isbns)):
                 excluded += 1
                 continue
-            seen.add(key)
-            seen_identifiers.update({valid_asin(code) for code in identifiers} - {''})
             seed = seeds.get(key, {})
             saved = {'book_id': b['id'], 'title': seed.get('title', b['title']), 'author': seed.get('author', b['author']),
                      'isbn': valid_asin(b['asin']) or seed.get('isbn', '') or b['isbn'], 'url': 'https://www.goodreads.com/book/show/' + seed['id'] if seed else '',
                      'confirmed': 0, 'public_rating': None, 'completed_date': completed_date(b['ramp_finished'] or b['finished_at'])} | match
             saved.update(id=b['id'], original_title=b['title'], original_author=b['author'], audio_isbn=b['isbn'], audio_asin=b['asin'], failure=failures.get(b['id'], ''))
+            latest = latest_items.get(b['id'], {})
+            saved['import_state'] = {'exported': 'exported-unconfirmed', 'failed': 'import-failed',
+                                     'review': 'returned-to-review'}.get(latest.get('state'), 'never-attempted')
+            if latest.get('state') != 'failed':
+                saved['failure'] = ''
+            saved['skipped'] = bool(match.get('ignored'))
             context = contexts.get(b['id'], {})
             if context.get('automatic') and valid_asin(b['asin']):
                 # Only automatic catalog choices yield to the owned edition.
@@ -348,10 +362,10 @@ class Goodreads:
             saved['source_snapshot'] = source_snapshot(b)
             saved['source_changed'] = bool(match and context.get('source_snapshot') != source_snapshot(b))
             saved['provenance'] = context.get('provenance', 'Unreviewed source metadata')
-            saved['reason'] = context.get('reason', 'Review work, authors, language, ISBN and genuine completion date.')
+            saved['reason'] = context.get('reason', 'Review title, author, identifier and genuine completion date, then Save.')
             if saved['source_changed']:
                 saved['reason'] = 'Source metadata changed or prior confirmation has no source snapshot. Re-review required; saved details retained.'
-            saved['ready'] = bool(not saved['source_changed'] and saved['confirmed'] and valid_identifier(saved['isbn']) and genuine_date(saved['completed_date']) and safe_export_text(saved['title']) and safe_export_text(saved['author']))
+            saved['ready'] = bool(not saved['skipped'] and not saved['source_changed'] and saved['confirmed'] and valid_identifier(saved['isbn']) and genuine_date(saved['completed_date']) and safe_export_text(saved['title']) and safe_export_text(saved['author']))
             saved['automatic'] = bool(context.get('automatic'))
             saved['saved_decision'] = bool(match)
             persisted = attempts.get((b['id'], saved['source_snapshot']))
@@ -482,7 +496,7 @@ class Goodreads:
             except Exception:
                 result = {'id': book_id, 'automatic': False, 'provider_error': True,
                           'reason': 'Lookup failed or state changed. Nothing overwritten; review this book explicitly.'}
-            state = 'skipped' if result.get('skipped') else 'ready' if result.get('automatic') else 'provider_error' if result.get('provider_error') else 'review'
+            state = 'skipped' if result.get('skipped') else 'suggested' if result.get('automatic') else 'provider_error' if result.get('provider_error') else 'review'
             with self.store.lock, self.store.db() as db:
                 db.execute('UPDATE gr_match_job_items SET state=?,result=? WHERE job_id=? AND book_id=?',
                            (state, json.dumps(result), job_id, book_id))
@@ -545,7 +559,7 @@ class Goodreads:
             with self.store.lock:
                 eligible = {b['id']: b for b in self.review()['books']}
                 if book_id not in eligible:
-                    raise AppError('Only completed, not-yet-exported review entries can be resolved.')
+                    raise AppError('Only completed, not-yet-confirmed-imported review entries can be resolved.')
                 with self.store.db() as db:
                     source = dict(db.execute('SELECT * FROM books WHERE id=?', (book_id,)).fetchone())
                     prior = db.execute('SELECT 1 FROM gr_matches WHERE book_id=?', (book_id,)).fetchone()
@@ -577,26 +591,26 @@ class Goodreads:
                 candidate = result.get('candidate')
                 if candidate:
                     prior_reads = [dict(r) for r in db.execute("SELECT title,author,isbn FROM history WHERE shelf='read' OR date_read<>'' OR read_count>0")]
-                    prior_exports = [dict(r) for r in db.execute("SELECT title,author,isbn FROM gr_export_items WHERE state IN ('exported','imported')")]
+                    prior_exports = [dict(r) for r in db.execute("SELECT title,author,isbn FROM gr_export_items WHERE state='imported'")]
                     if any(work_identity(candidate) == work_identity(r) or canonical_identifier(candidate['isbn']) == canonical_identifier(r['isbn'])
                            for r in prior_reads + prior_exports):
                         automatic = False
                         result = result | {'high_confidence': False, 'skipped': True,
-                                           'reason': 'Skipped: candidate work/ISBN already in Goodreads read history or an existing export.'}
+                                            'reason': 'Skipped: candidate work/identifier already in Goodreads read history or a confirmed import.'}
                 if automatic:
                     candidate = result['candidate']
-                    db.execute('INSERT INTO gr_matches VALUES (?,?,?,?,?,?,1,NULL,?,0,?)',
+                    db.execute('INSERT INTO gr_matches VALUES (?,?,?,?,?,?,0,NULL,?,0,?)',
                                (book_id, candidate['title'], candidate['author'], candidate['isbn'], '', '', eligible[book_id]['completed_date'], now()))
                     db.execute('INSERT OR REPLACE INTO gr_match_context VALUES (?,?,?,?,?,1)',
                                 (book_id, source_snapshot(source), result['provenance'], result['reason'], json.dumps(result)))
                 db.execute('INSERT OR REPLACE INTO gr_catalog_attempts VALUES (?,?,?)',
                            (book_id, source_snapshot(source), json.dumps(result)))
             results.append(result | {'id': book_id, 'automatic': automatic,
-                                      'reason': result['reason'] + ('' if automatic else ' Export stays blocked; lookup could not run.' if result.get('provider_error') else ' Not auto-saved: review candidate, existing decision and completion date.')})
+                                      'reason': result['reason'] + (' Suggestion filled; review and Save before exporting.' if automatic else ' Export stays blocked; lookup could not run.' if result.get('provider_error') else ' Not auto-saved: review candidate, existing decision and completion date.')})
         return {'results': results}
 
     def auto_resolve(self):
-        """One book per list load, ten per rolling day/process; never a bulk job.
+        """Optional one-book action, ten per rolling day/process; never a bulk job.
 
         Fingerprint attempts (including uncertainty/errors) are retained durably.
         Existing decisions and failed imports are never sent or overwritten.
@@ -649,7 +663,7 @@ class Goodreads:
         with self.store.lock:
             eligible = {b['id']: b for b in self.review()['books']}
             if any(i not in eligible or not eligible[i]['ready'] for i in ids):
-                raise AppError('Save and confirm each selected match, identifier and completion date before exporting. Already exported books are excluded.')
+                raise AppError('Save each selected identifier and completion date before exporting. Confirmed imported books are excluded.')
             output = io.StringIO(newline='')
             writer = csv.writer(output, lineterminator='\r\n')
             writer.writerow(HEADERS)
@@ -675,6 +689,35 @@ class Goodreads:
     def batch_items(self, batch_id):
         with self.store.db() as db:
             return {'items': [dict(r) for r in db.execute('SELECT book_id AS id,title,author,isbn,state,substr(failure,1,500) AS failure FROM gr_export_items WHERE batch_id=? ORDER BY rowid', (batch_id,))]}
+
+    def return_to_review(self, p):
+        """An individual unconfirmed title, never a batch reset or decision deletion."""
+        with self.store.lock, self.store.db() as db:
+            item = db.execute('SELECT * FROM gr_export_items WHERE batch_id=? AND book_id=?',
+                              (p.get('batch_id'), p.get('book_id'))).fetchone()
+            if not item:
+                raise AppError('Select a title from this export batch only.')
+            latest = db.execute('''SELECT i.* FROM gr_export_items i JOIN gr_exports e ON e.id=i.batch_id
+                WHERE i.book_id=? ORDER BY e.rowid DESC LIMIT 1''', (item['book_id'],)).fetchone()
+            if latest['state'] == 'imported':
+                raise AppError('This title is confirmed imported; only unconfirmed titles can return to review.')
+            db.execute("UPDATE gr_export_items SET state='review',failure='' WHERE batch_id=? AND book_id=?",
+                       (latest['batch_id'], item['book_id']))
+            db.execute('UPDATE gr_matches SET confirmed=0 WHERE book_id=?', (item['book_id'],))
+        return {'returned': True}
+
+    def confirm_imported(self, p):
+        """Explicit per-title confirmation on the latest batch, without parsing prose."""
+        with self.store.lock, self.store.db() as db:
+            latest = db.execute('''SELECT i.* FROM gr_export_items i JOIN gr_exports e ON e.id=i.batch_id
+                WHERE i.book_id=? ORDER BY e.rowid DESC LIMIT 1''', (p.get('book_id'),)).fetchone()
+            if not latest or latest['batch_id'] != p.get('batch_id'):
+                raise AppError('Confirm a title from its latest export batch only.')
+            if latest['state'] != 'exported':
+                raise AppError('Only an exported-unconfirmed title can be confirmed imported.')
+            db.execute("UPDATE gr_export_items SET state='imported',failure='' WHERE batch_id=? AND book_id=?",
+                       (latest['batch_id'], latest['book_id']))
+        return {'confirmed_imported': True}
 
     def reconcile(self, p):
         batch = p.get('batch_id')

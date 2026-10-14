@@ -4,7 +4,7 @@ let grMatchJob = null, grBatchRunning = false, grBatchCancelled = false, grBatch
 function grMatchProgress(note = '') {
   if (!grMatchJob) {$('#gr-match-progress').textContent = note; return;}
   const items = grMatchJob.items, count = state => items.filter(i => i.state === state).length;
-  $('#gr-match-progress').textContent = `${items.length - count('queued')} / ${items.length} processed · ${count('ready')} ready · ${count('review')} review · ${count('skipped')} skipped · ${count('provider_error') + count('pending')} provider errors / interrupted.${note ? ' ' + note : ''}`;
+  $('#gr-match-progress').textContent = `${items.length - count('queued')} / ${items.length} processed · ${count('suggested') + count('ready')} suggested (Save required) · ${count('review')} review · ${count('skipped')} skipped · ${count('provider_error') + count('pending')} provider errors / interrupted.${note ? ' ' + note : ''}`;
   $('#gr-match-eligible').textContent = count('queued') ? 'Match eligible books (resume)' : 'Match eligible books';
 }
 async function matchEligibleBooks(retryProvider = false) {
@@ -56,7 +56,7 @@ function grPayload(form, book) {
   const value = k => form.elements[k].value;
   return {book_id: book.id, source_snapshot: book.source_snapshot, title: value('title'), author: value('author'), isbn: value('isbn'), url: value('url'),
     completed_date: value('completed_date'), public_rating: value('public_rating') ? Number(value('public_rating')) : null,
-    confirmed: form.elements.confirmed.checked, ignored: false};
+    confirmed: true, ignored: false};
 }
 // Client-side checksum validation mirroring the server, used only to offer a
 // direct Goodreads /book/isbn/ link. A valid checksum never asserts that
@@ -73,17 +73,20 @@ function canonicalIsbn(value) {
   }
   return '';
 }
-async function loadGoodreads(automatic = true) {
+async function loadGoodreads(automatic = false) {
   const ticket = ++grTicket, result = await api('/api/goodreads'); if (ticket !== grTicket) return;
   grBooks = result.books; grSelected = new Set([...grSelected].filter(id => grBooks.some(b => b.id === id && b.ready)));
   grMatchJob = result.match_job || null; grDirty = false; grMatchProgress();
-  $('#gr-books').replaceChildren(); $('#gr-summary').textContent = `${result.books.filter(b => b.ready).length} ready to export; ${result.books.filter(b => !b.ready).length} need review or a catalog check. ${result.excluded} entries excluded because they were already read, exported, duplicated, ignored, or marked did not finish.`;
+  $('#gr-books').replaceChildren(); $('#gr-summary').textContent = `${result.books.length} completed books not confirmed imported · ${result.books.filter(b => b.ready).length} saved and ready. ${result.excluded} confirmed/read-history entries excluded. Exported-unconfirmed books stay here; re-importing is safe.`;
   if (!result.books.length) $('#gr-books').append(el('div', 'empty', 'All caught up. New completions will appear here.'));
   for (const book of result.books) {
     const card = el('article', 'paper gr-book'), heading = el('div', 'gr-heading'), checkLabel = el('label', 'check'), check = el('input'); check.type = 'checkbox'; check.disabled = !book.ready; check.checked = grSelected.has(book.id); check.setAttribute('aria-label', 'Export ' + book.title);
     check.addEventListener('change', () => {check.checked ? grSelected.add(book.id) : grSelected.delete(book.id); grCount();});
-    checkLabel.append(check, el('span', '', book.original_title)); heading.append(checkLabel);
-    const status = el('p', 'muted', (book.ready ? 'Ready to export. ' : book.provider_error ? 'Lookup could not run; export stays blocked. ' : 'Review required. ') + book.provenance + ': ' + (book.lookup_status || book.reason)); card.append(heading, el('p', 'muted', book.original_author), status);
+    const cover = el('img', 'gr-cover'); cover.src = '/api/cover?id=' + encodeURIComponent(book.id); cover.alt = 'Cover of ' + book.title; cover.loading = 'lazy'; cover.addEventListener('error', () => {cover.hidden = true;});
+    checkLabel.append(check, el('span', '', book.title)); heading.append(cover, checkLabel);
+    const status = el('p', 'muted', (book.ready ? 'Ready to export. ' : book.provider_error ? 'Lookup could not run; export stays blocked. ' : 'Review required. ') + book.provenance + ': ' + (book.lookup_status || book.reason)); card.append(heading, el('p', 'muted', book.author), status);
+    if (book.original_author !== book.author) card.append(el('p', 'muted', 'ABS author metadata: ' + book.original_author));
+    card.append(el('p', 'gr-state', `${book.import_state || 'never-attempted'}${book.skipped ? ' · skipped (Save to resume)' : ''}`));
     if (book.retry_eligible) {
       const retry = el('button', 'secondary', 'Retry provider-blocked books (up to 25)'); retry.type = 'button';
       retry.addEventListener('click', () => matchEligibleBooks(true)); card.append(retry);
@@ -99,13 +102,16 @@ async function loadGoodreads(automatic = true) {
       try { await fn(); } catch (error) { lookupError.textContent = error.message; lookupError.hidden = false; detail.open = true; throw error; }
     });
     if (book.failure) card.append(el('p', 'error-note', 'Previous import failed: ' + book.failure.slice(0, 500) + '. Correct the match and confirm it again.'));
-    const detail = el('details'), summary = el('summary', '', 'Review book & public rating'), form = el('form', 'gr-form');
+    const detail = el('details'), summary = el('summary', '', 'More details ▾'), form = el('form', 'gr-form'), extras = el('div', 'gr-details');
     if (book.suggestion) card.append(el('p', 'muted', `Saved catalog suggestion (unconfirmed): ${book.suggestion.title} — ${book.suggestion.author} · ${book.suggestion.isbn}. Use Find work ISBN or copy these details for review.`));
     for (const candidate of (book.candidates || []).slice(0, 10)) card.append(el('p', 'muted', `Catalog evidence (not a confirmed match): ${candidate.title} — ${candidate.author} · ${(candidate.isbns || []).join(', ')}`));
-    form.append(field('Goodreads title', 'title', book.title), field('Author(s) — review roles; do not drop coauthors', 'author', book.author), field('Identifier — audiobook ASIN or catalog ISBN; Goodreads acceptance unverified', 'isbn', book.isbn), field('Goodreads book link', 'url', book.url, 'url'), field('Date completed — exported as Date Read', 'completed_date', book.completed_date, 'date'));
+    extras.append(field('Goodreads title', 'title', book.title), field('Author(s) — review roles; do not drop coauthors', 'author', book.author), field('Goodreads book link', 'url', book.url, 'url'), field('Date completed — exported as Date Read', 'completed_date', book.completed_date, 'date'));
+    detail.append(summary, extras); form.append(detail);
+    form.append(field('Paste ASIN or checksum-valid ISBN-10/13', 'isbn', book.isbn));
     const ratingLabel = el('label', '', 'Public Goodreads stars'), rating = el('select'); rating.name = 'public_rating';
     for (const [value, text] of [['', 'Leave unrated'], ['1', '★'], ['2', '★★'], ['3', '★★★'], ['4', '★★★★'], ['5', '★★★★★']]) { const option = el('option', '', text); option.value = value; rating.append(option); } rating.value = book.public_rating ?? ''; ratingLabel.append(rating); form.append(ratingLabel, el('p', 'muted', 'These stars are only for Goodreads. Your private rating, notes and recommendations stay separate.'));
-    const confirmLabel = el('label', 'check'), confirmed = el('input'); confirmed.type = 'checkbox'; confirmed.name = 'confirmed'; confirmed.checked = Boolean(book.confirmed && !book.source_changed); confirmLabel.append(confirmed, el('span', '', 'I checked the work and full author set. A print, Kindle, large-print or translated edition may represent the audiobook; ISBN checksum alone is not a match.')); form.append(confirmLabel);
+    const confirmed = el('input'); confirmed.type = 'hidden'; confirmed.name = 'confirmed'; confirmed.checked = Boolean(book.confirmed && !book.source_changed);
+    form.append(confirmed, el('p', 'muted', 'Save confirms your chosen book details for export, not that Goodreads imported it.'));
     const actions = el('div', 'question-buttons');
     const search = el('a', 'button-link secondary', 'Find Goodreads match'), printSearch = el('a', 'button-link secondary', 'Find print/ebook edition');
     // External Google search only; no crawling and no Goodreads request. The
@@ -120,16 +126,15 @@ async function loadGoodreads(automatic = true) {
     // asserts that Goodreads recognizes or will import this ISBN.
     const updateIsbnLink = () => {const code = canonicalIsbn(form.elements.isbn.value); isbnLink.hidden = !code; if (code) isbnLink.href = 'https://www.goodreads.com/book/isbn/' + code;};
     updateIsbnLink();
-    const lookup = el('button', 'secondary', 'Get ISBN from link'), save = el('button', '', 'Save export details'), ignore = el('button', 'secondary', 'Skip this book'); lookup.type = ignore.type = 'button'; save.type = 'submit';
+    const lookup = el('button', 'secondary', 'Get ISBN from link'), save = el('button', '', 'Save'), ignore = el('button', 'secondary', 'Skip this book'); lookup.type = ignore.type = 'button'; save.type = 'submit';
     const resolve = el('button', 'secondary', 'Find work ISBN (free catalogs)'); resolve.type = 'button';
     resolve.addEventListener('click', () => lookupAction(resolve, async () => {
       const response = await api('/api/goodreads/resolve', {book_ids: [book.id], title: form.elements.title.value, author: form.elements.author.value, source_snapshot: book.source_snapshot}), result = response.results[0];
       // Explicit lookups are suggestions, never a reload that discards any form.
       if (result.candidate) {
         status.textContent = `Suggestion: ${result.candidate.title} — ${result.candidate.author} · catalog ISBN ${result.candidate.isbn}. Existing edits retained. `;
-        if (!grDirty && !book.saved_decision && !book.confirmed) {
-          form.elements.title.value = result.candidate.title; form.elements.author.value = result.candidate.author;
-          if (book.isbn !== book.audio_asin && (!/^[A-Z0-9]{10}$/.test(book.isbn || '') || canonicalIsbn(book.isbn))) form.elements.isbn.value = result.candidate.isbn;
+        if (!form.elements.isbn.value.trim() && !book.saved_decision) {
+          form.elements.isbn.value = result.candidate.isbn;
           grDirty = true; updateIsbnLink();
         }
         confirmed.checked = false; check.disabled = true; check.checked = false; grSelected.delete(book.id); grCount();
@@ -139,23 +144,46 @@ async function loadGoodreads(automatic = true) {
     }));
     lookup.addEventListener('click', () => lookupAction(lookup, async () => {
       if (!form.elements.url.value.trim()) throw new Error('Get ISBN from link needs a Goodreads book link. Paste one above (use Find print/ebook edition to find the print edition first), or use Find work ISBN (free catalogs) without a link.');
-      const result = await api('/api/goodreads/lookup', {url: form.elements.url.value}); form.elements.isbn.value = result.isbn; form.elements.url.value = result.url; updateIsbnLink();
-      if (result.title) form.elements.title.value = result.title; if (result.author) form.elements.author.value = result.author;
+      const result = await api('/api/goodreads/lookup', {url: form.elements.url.value});
+      if (!form.elements.isbn.value.trim() && !book.saved_decision) form.elements.isbn.value = result.isbn;
+      status.textContent = `Link suggestion: ISBN ${result.isbn}. Existing manual details retained.`; updateIsbnLink();
       form.elements.confirmed.checked = false; check.disabled = true; check.checked = false; grSelected.delete(book.id); grCount(); message('ISBN retrieved. Review the title, author roles and edition, confirm the match, then save.');
     }));
     form.addEventListener('input', e => {if (['title', 'author', 'isbn', 'url'].includes(e.target.name)) confirmed.checked = false; check.disabled = true; check.checked = false; grSelected.delete(book.id); grCount(); status.textContent = 'Unsaved changes — review and save before exporting'; updateIsbnLink();});
-    form.addEventListener('submit', e => {e.preventDefault(); action(save, async () => {
-      const payload = grPayload(form, book); await api('/api/goodreads/save', payload); await loadGoodreads(); message('Goodreads details saved. Your private review is unchanged.');
+    form.addEventListener('submit', e => {e.preventDefault(); lookupAction(save, async () => {
+      const payload = grPayload(form, book);
+      if (!canonicalIsbn(payload.isbn) && !/^[A-Z0-9]{10}$/.test(payload.isbn)) throw new Error('Enter a checksum-valid ISBN-10/13 or an ASIN of exactly 10 uppercase alphanumeric characters.');
+      await api('/api/goodreads/save', payload); grSelected.add(book.id); await loadGoodreads(); message('Saved for export. Your private review is unchanged.');
     });});
-    ignore.addEventListener('click', () => action(ignore, async () => {await api('/api/goodreads/save', {...grPayload(form, book), ignored: true}); grSelected.delete(book.id); card.remove(); grCount(); message('Skipped this book for Goodreads.');}));
-    actions.append(resolve, search, printSearch, isbnLink, lookup, save, ignore); form.append(actions); detail.append(summary, form); card.append(detail); $('#gr-books').append(card);
+    ignore.addEventListener('click', () => action(ignore, async () => {await api('/api/goodreads/save', {...grPayload(form, book), confirmed: false, ignored: true}); grSelected.delete(book.id); await loadGoodreads(); message('Skipped for export. Its details remain here; Save to resume.');}));
+    actions.append(search, save); extras.append(resolve, printSearch, isbnLink, lookup, ignore); form.append(actions, detail); card.append(form); $('#gr-books').append(card);
   }
   const previousBatch = $('#gr-batch').value;
   $('#gr-batches').replaceChildren(); $('#gr-batch').replaceChildren();
   for (const batch of result.batches) {
     const option = el('option', '', `${new Date(batch.created_at).toLocaleString()} · ${batch.count} books`); option.value = batch.id; $('#gr-batch').append(option);
     const row = el('div', 'batch-row'), text = el('span', '', `${new Date(batch.created_at).toLocaleString()} · ${batch.count} exported · ${batch.failed} failed · ${batch.imported} confirmed imported`), download = el('button', 'secondary', 'Download again');
-    download.addEventListener('click', () => action(download, async () => downloadCSV(await api('/api/goodreads/batch?id=' + encodeURIComponent(batch.id))))); row.append(text, download); $('#gr-batches').append(row);
+    download.addEventListener('click', () => action(download, async () => downloadCSV(await api('/api/goodreads/batch?id=' + encodeURIComponent(batch.id)))));
+    const titles = el('details'), label = el('summary', '', 'View individual titles'), list = el('div');
+    titles.append(label, list); titles.addEventListener('toggle', async () => {
+      if (!titles.open || list.children.length) return;
+      try {
+        const data = await api('/api/goodreads/batch-items?id=' + encodeURIComponent(batch.id));
+        for (const item of data.items) {
+          const entry = el('div', 'batch-title'); entry.append(el('span', '', `${item.title} — ${item.author} · ${item.isbn} · ${item.state === 'imported' ? 'confirmed imported' : item.state === 'exported' ? 'exported-unconfirmed' : item.state}`));
+          if (item.state !== 'imported') {
+            const back = el('button', 'secondary', 'Return to review'); back.type = 'button';
+            back.addEventListener('click', () => action(back, async () => {await api('/api/goodreads/return-to-review', {batch_id: batch.id, book_id: item.id}); await loadGoodreads(); message('Returned this title to review; saved details and export history retained.');})); entry.append(back);
+          }
+          if (item.state === 'exported') {
+            const imported = el('button', 'secondary', 'I confirm this title imported'); imported.type = 'button';
+            imported.addEventListener('click', () => action(imported, async () => {await api('/api/goodreads/confirm-imported', {batch_id: batch.id, book_id: item.id}); await loadGoodreads(); message('This title is now confirmed imported.');})); entry.append(imported);
+          }
+          list.append(entry);
+        }
+      } catch (error) {message(error.message, true);}
+    });
+    row.append(text, download, titles); $('#gr-batches').append(row);
   }
   if (result.batches.some(b => b.id === previousBatch)) $('#gr-batch').value = previousBatch;
   $('#gr-reconcile-form').hidden = !result.batches.length; grCount();
@@ -175,7 +203,7 @@ async function loadGoodreads(automatic = true) {
   }
 }
 $('#gr-select-ready').addEventListener('click', () => {for (const check of $('#gr-books').querySelectorAll('input[type=checkbox][aria-label]')) if (!check.disabled && !check.checked) check.click();});
-$('#gr-export').addEventListener('click', () => action($('#gr-export'), async () => {const result = await api('/api/goodreads/export', {book_ids: [...grSelected]}); downloadCSV(result); grSelected.clear(); await loadGoodreads(); message(`${result.count} books exported with completion dates. They are now excluded from new exports. Re-download this batch if needed; paste any failed imports below.`);}).then(grCount));
+$('#gr-export').addEventListener('click', () => action($('#gr-export'), async () => {const result = await api('/api/goodreads/export', {book_ids: [...grSelected]}); downloadCSV(result); grSelected.clear(); await loadGoodreads(); message(`${result.count} books exported. They stay exported-unconfirmed until you explicitly confirm imports below. Paste any errors there.`);}).then(grCount));
 $('#gr-reload').addEventListener('click', () => action($('#gr-reload'), () => loadGoodreads()));
 async function chooseFailedBooks() {
   const result = await api('/api/goodreads/batch-items?id=' + encodeURIComponent($('#gr-batch').value)); $('#gr-failures').replaceChildren();

@@ -228,6 +228,10 @@ def handler(store, port, access_policy=None, notifications=None, ai=None, covers
                         result = goodreads.export(payload.get('book_ids'))
                     elif self.path == '/api/goodreads/reconcile':
                         result = goodreads.reconcile(payload)
+                    elif self.path == '/api/goodreads/return-to-review':
+                        result = goodreads.return_to_review(payload)
+                    elif self.path == '/api/goodreads/confirm-imported':
+                        result = goodreads.confirm_imported(payload)
                     elif self.path == '/api/bookramp/create':
                         result = telemetry.create(payload)
                     elif self.path == '/api/bookramp/revoke':

@@ -424,6 +424,10 @@ class CatalogTests(unittest.TestCase):
 
 
 class ExportAutomationTests(unittest.TestCase):
+    def confirm_suggestion(self):
+        row = self.gr.review()['books'][0]
+        self.gr.save(row | {'book_id': row['id'], 'confirmed': True, 'ignored': False})
+
     def test_catalog_subtitle_and_narrator_author_saved_visible_and_exported(self):
         self.abs.items[0]['media']['metadata']['authorName'] = 'Voice - narrator'
         self.store.sync()
@@ -435,6 +439,7 @@ class ExportAutomationTests(unittest.TestCase):
         self.assertEqual(row['original_author'], 'Voice - narrator')
         self.assertEqual(row['author'], 'Writer')
         self.assertEqual(row['title'], 'One: A Novel')
+        self.confirm_suggestion()
         exported = list(csv.DictReader(io.StringIO(self.gr.export(['one'])['csv'])))[0]
         self.assertEqual(exported['Author'], 'Writer')
         self.assertEqual(exported['Title'], 'One: A Novel')
@@ -451,6 +456,7 @@ class ExportAutomationTests(unittest.TestCase):
         row = self.gr.review()['books'][0]
         self.assertEqual(row['original_author'], 'Voice')
         self.assertEqual(row['author'], 'Writer, Coauthor')
+        self.confirm_suggestion()
         exported = list(csv.DictReader(io.StringIO(self.gr.export(['one'])['csv'])))[0]
         self.assertEqual(exported['Author'], 'Writer, Coauthor')
 
@@ -545,15 +551,16 @@ class ExportAutomationTests(unittest.TestCase):
         self.assertNotIn('PRIVATE', str(request.call_args_list))
         self.assertNotIn('finished', str(request.call_args_list))
         row = self.gr.review()['books'][0]
-        self.assertTrue(row['ready'])
+        self.assertFalse(row['ready'])
         self.assertTrue(row['automatic'])
         self.assertEqual(row['provenance'], 'Google Books')
+        self.confirm_suggestion()
         batch = self.gr.export(['one'])
         rows = list(csv.reader(io.StringIO(batch['csv'])))
         self.assertEqual(rows[0], HEADERS)
         self.assertEqual(rows[1], ['One', 'Writer', '9780306406157', '', '2026-10-01', 'read'])
         self.assertNotIn('PRIVATE', batch['csv'])
-        with self.assertRaises(AppError): self.gr.export(['one'])
+        self.assertEqual(self.gr.review()['books'][0]['import_state'], 'exported-unconfirmed')
         self.assertEqual(self.abs.writes, [])
         self.gr.reconcile({'batch_id': batch['id'], 'failed_ids': ['one']})
         self.assertFalse(self.resolve()['automatic'])
@@ -608,13 +615,15 @@ class ExportAutomationTests(unittest.TestCase):
         with self.store.db() as db:
             self.assertEqual(db.execute('SELECT count(*) FROM gr_matches').fetchone()[0], 0)
 
-    def test_unknown_and_different_language_are_export_ready(self):
+    def test_unknown_and_different_language_suggestions_need_confirmation(self):
         for lang in ('', 'German'):
             self.abs.items[0]['media']['metadata']['language'] = lang
             self.store.sync()
             with self.store.db() as db:
                 db.execute('DELETE FROM gr_matches')
             self.assertTrue(self.resolve()['automatic'])
+            self.assertFalse(self.gr.review()['books'][0]['ready'])
+            self.confirm_suggestion()
             self.assertTrue(self.gr.review()['books'][0]['ready'])
 
     def test_batch_without_catalog_isbn_stays_review(self):
@@ -648,10 +657,12 @@ class ExportAutomationTests(unittest.TestCase):
             self.assertFalse(row['ready'])
         self.abs.items[0]['media']['metadata'] = baseline
         self.store.sync()
+        self.confirm_suggestion()
         batch = self.gr.export(['one'])
         self.abs.items[0]['media']['metadata'] = baseline | {'title': 'Changed After Export', 'authorName': 'Other Writer'}
         self.store.sync()
-        self.assertEqual(self.gr.review()['books'], [])  # ABS export identity persists
+        self.assertEqual(self.gr.review()['books'][0]['import_state'], 'exported-unconfirmed')
+        self.assertFalse(self.gr.review()['books'][0]['ready'])  # changed metadata needs review
         self.assertEqual(self.gr.batch(batch['id'])['csv'], batch['csv'])
 
     def test_completion_race_does_not_auto_save(self):
@@ -667,7 +678,8 @@ class ExportAutomationTests(unittest.TestCase):
     def test_no_action_auto_prefill_and_no_repeat_or_failed_lookup(self):
         with patch.object(self.gr.catalog, 'request', return_value=GOOGLE) as request:
             self.assertTrue(self.gr.auto_resolve()['results'][0]['automatic'])
-            self.assertTrue(self.gr.review()['books'][0]['ready'])
+            self.assertFalse(self.gr.review()['books'][0]['ready'])
+            self.confirm_suggestion()
             self.gr.auto_last = -100
             self.assertEqual(self.gr.auto_resolve()['results'], [])
             batch = self.gr.export(['one'])
@@ -757,7 +769,7 @@ class ExportAutomationTests(unittest.TestCase):
                         restarted.resolve({'book_ids': [entry['id']], 'batch_id': job['id']})
                 self.assertEqual(second.call_count, 18)
         done = restarted.match_job()
-        self.assertTrue(all(i['state'] in ('ready', 'review', 'provider_error') for i in done['items']))
+        self.assertTrue(all(i['state'] in ('suggested', 'review', 'provider_error') for i in done['items']))
         review = restarted.review()['books']
         attempted_ids = {i['id'] for i in done['items']}
         self.assertTrue(all(not b['match_eligible'] for b in review if b['id'] in attempted_ids))

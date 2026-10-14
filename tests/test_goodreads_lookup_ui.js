@@ -36,7 +36,8 @@ async function main() {
   const source = fs.readFileSync('static/companion.js', 'utf8');
   vm.runInContext(source.slice(0, source.indexOf('function displayNumber')), context);
   await context.loadGoodreads();
-  assert.equal(calls.filter(c => c[0].endsWith('auto-resolve')).length, 1, 'no per-card loop or recursive auto retry');
+   assert.equal(calls.filter(c => c[0].endsWith('auto-resolve')).length, 0, 'catalog matching is optional; list loads make no provider calls');
+   assert.ok($('#gr-books').children[0].all().some(n => n.tag === 'img' && n.src === '/api/cover?id=synthetic'));
   let card = $('#gr-books').children[0];
   let lookup = card.all().find(n => n.textContent === 'Get ISBN from link');
   await lookup.listeners.click[0]();
@@ -47,7 +48,7 @@ async function main() {
   assert.match(card.all().find(n => n.className === 'error-note').textContent, /Public catalog unavailable/);
   let release;
   hold = new Promise(resolve => {release = resolve;});
-  const pending = context.loadGoodreads();
+   const pending = context.loadGoodreads(true); // legacy bounded endpoint remains explicitly callable
   await new Promise(resolve => setImmediate(resolve));
   card = $('#gr-books').children[0];
   card.all().find(n => n.name === 'title').value = 'Unsaved user edit';

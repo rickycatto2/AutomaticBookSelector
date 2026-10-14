@@ -67,7 +67,7 @@ class IdentifierTests(unittest.TestCase):
     def test_asin_auto_resolves_without_provider(self):
         with patch.object(self.gr.catalog, 'resolve', side_effect=AssertionError('No provider needed')):
             self.assertTrue(self.gr.resolve({'book_ids': ['one']})['results'][0]['automatic'])
-        self.assertTrue(self.gr.review()['books'][0]['ready'])
+        self.assertFalse(self.gr.review()['books'][0]['ready'])  # suggestion requires explicit Save
 
     def test_saved_isbn_never_overwritten(self):
         self.save('9780306406157')
@@ -95,7 +95,7 @@ class IdentifierTests(unittest.TestCase):
         self.gr.export(['one'])
         with self.store.db() as db:
             db.execute("UPDATE books SET finished=1,finished_at='2026-10-01',asin='B0CHYSM5M4' WHERE id='two'")
-        self.assertEqual(self.gr.review()['books'], [])
+        self.assertEqual({b['id'] for b in self.gr.review()['books']}, {'one', 'two'})
 
     def test_formula_guard_and_missing_date(self):
         for code in ('=B0CHYSM5M4', '+B0CHYSM5M4', '@B0CHYSM5M4', '-B0CHYSM5M4'):

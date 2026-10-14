@@ -4,6 +4,7 @@ import unittest
 from core import AppError
 from goodreads import import_report
 import test_companion
+from test_core import item
 
 
 class ReconcileTests(unittest.TestCase):
@@ -63,12 +64,86 @@ class ReconcileTests(unittest.TestCase):
         self.assertTrue(import_report(header.replace('1 book', '2 books') + '9781250292896\t\tWriter', items)[3])
         self.assertFalse(import_report(header + '9781250292896\t\tWriter', items + [items[0] | {'book_id': 'two'}])[0])
 
+    def test_observed_17_row_export_16_blank_title_rejections(self):
+        # Observed report shape/identifiers; other identifiers and personal
+        # titles/authors are synthetic. No user library or network access.
+        identifiers = ['B0FS8Y2G2T', '0593214218', '0306406152'] + [
+            f'B0TEST{i:04d}' for i in range(13)]
+        ids = [f'rejected-{i}' for i in range(16)] + ['accepted']
+        self.abs.items.extend(item(book, book.title(), 'Writer ' + str(i))
+                              for i, book in enumerate(ids))
+        self.store.sync()
+        for i, book in enumerate(ids):
+            self.finish(book)
+            self.match(book, author='Writer ' + str(i),
+                       isbn=identifiers[i] if i < 16 else '9798217058785')
+        batch = self.gr.export(ids)
+        self.assertEqual(batch['count'], 17)
+        for separator in ('\t\t', '  ', ' '):
+            # Goodreads can report ISBN-13 for an exported ISBN-10.
+            reported = identifiers[:]
+            reported[2] = '9780306406157'
+            text = '16 books could not be imported:\nISBN Title Author\n' + '\n'.join(
+                code + separator + 'Writer ' + str(i) for i, code in enumerate(reported))
+            text += '\nImported: Accepted by Writer 16'
+            payload = {'batch_id': batch['id'], 'text': text, 'confirm_remaining': True}
+            preview = self.gr.reconcile(payload | {'preview': True})
+            self.assertEqual(len(preview['flagged']), 16, separator)
+            self.assertFalse(preview['ambiguous'], separator)
+            self.assertTrue(preview['can_confirm_remaining'])
+            self.assertTrue(preview['mixed'])
+            self.assertEqual(set(self.states(batch).values()), {'exported'})
+        self.gr.reconcile(payload)
+        self.assertEqual(self.states(batch), {book: 'failed' for book in ids[:-1]} | {'accepted': 'imported'})
+        review = self.gr.review()['books']
+        self.assertEqual({b['id'] for b in review}, set(ids[:-1]))
+        self.assertTrue(all(not b['ready'] and not b['confirmed'] for b in review))
+        self.assertEqual(self.gr.batch(batch['id'])['csv'], batch['csv'])
+
+    def test_asin_context_boundaries_success_and_ambiguity(self):
+        entry = {'book_id': 'one', 'title': 'One', 'author': 'Writer', 'isbn': 'B0FS8Y2G2T'}
+        header = '1 book could not be imported:\nISBN Title Author\n'
+        for text in ('Failed: B0FS8Y2G2T', 'Failed books\nASIN: B0FS8Y2G2T',
+                     header + 'B0FS8Y2G2T\t\tWriter', header + 'B0FS8Y2G2T  Writer'):
+            self.assertEqual(import_report(text, [entry])[0], {'one'}, text)
+        for text in ('B0FS8Y2G2T', 'Failed: xB0FS8Y2G2T', 'Failed: B0FS8Y2G2T-extra',
+                     'Failed: b0fs8y2g2t', header + 'B0FS8Y2G2T no errors for Writer',
+                     header + 'B0FS8Y2G2T Imported: Writer', header + 'B0FOREIGN1  Writer'):
+            failed, _, _, ambiguous = import_report(text, [entry])
+            self.assertFalse(failed, text)
+            self.assertTrue(ambiguous, text)
+        for text in ('Imported: B0FS8Y2G2T', header + 'Imported: B0FS8Y2G2T',
+                     'Failed: B0FS8Y2G2T\nImported: B0FS8Y2G2T',
+                     'Failed: B0FS8Y2G2T; Imported: B0FS8Y2G2T'):
+            failed, succeeded, _, _ = import_report(text, [entry])
+            self.assertFalse(failed)
+            self.assertEqual(succeeded, {'one'})
+        self.assertFalse(import_report(header + 'B0FS8Y2G2T  Writer',
+                                      [entry, entry | {'book_id': 'two'}])[0])
+
+    def test_asin_unknown_foreign_success_and_partial_report_gates(self):
+        batch = self.batch()
+        with self.store.db() as db:
+            db.execute("UPDATE gr_export_items SET isbn='B0FS8Y2G2T' WHERE book_id='one'")
+        for text in ('B0FS8Y2G2T', 'Failed: B0FOREIGN1', 'unknown text'):
+            result = self.gr.reconcile({'batch_id': batch['id'], 'text': text, 'confirm_remaining': True})
+            self.assertFalse(result['can_confirm_remaining'])
+            self.assertEqual(set(self.states(batch).values()), {'exported'})
+        with self.assertRaises(AppError):
+            self.gr.reconcile({'batch_id': batch['id'], 'text': 'Imported: B0FS8Y2G2T', 'failed_ids': ['one']})
+        payload = {'batch_id': batch['id'], 'text': 'Failed: B0FS8Y2G2T\nunknown row', 'confirm_remaining': True}
+        result = self.gr.reconcile(payload)
+        self.assertTrue(result['ambiguous'])
+        self.assertEqual(self.states(batch), {'one': 'failed', 'two': 'exported'})
+        self.gr.reconcile(payload | {'failed_ids': ['one']})
+        self.assertEqual(self.states(batch), {'one': 'failed', 'two': 'imported'})
+
     def test_latest_failed_state_not_masked_by_older_export_record(self):
         batch = self.batch()
         with self.store.db() as db:
             db.execute("INSERT INTO gr_exports VALUES ('synthetic-later','2026-10-12','retained')")
             db.execute("INSERT INTO gr_export_items SELECT 'synthetic-later',book_id,title_key,title,author,isbn,'failed','Rejected' FROM gr_export_items WHERE book_id='one'")
-        self.assertEqual([b['id'] for b in self.gr.review()['books']], ['one'])
+        self.assertEqual([b['id'] for b in self.gr.review()['books']], ['one', 'two'])
         self.assertEqual(self.states(batch)['one'], 'exported')
 
     def test_failed_abs_id_kept_visible_ahead_of_newer_duplicate_completion(self):
@@ -78,7 +153,7 @@ class ReconcileTests(unittest.TestCase):
         self.abs.items[1]['media']['metadata']['title'] = 'One'
         self.finish('two', '2026-10-02T18:00:00Z')
         self.gr.reconcile({'batch_id': batch['id'], 'failed_ids': ['one']})
-        self.assertEqual([b['id'] for b in self.gr.review()['books']], ['one'])
+        self.assertEqual([b['id'] for b in self.gr.review()['books']], ['one', 'two'])
 
     def test_no_context_unknown_empty_and_nonbool_do_not_import(self):
         batch = self.batch()

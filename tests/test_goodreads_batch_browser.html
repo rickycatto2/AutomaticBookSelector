@@ -11,7 +11,7 @@
   const books = Array.from({length: 30}, (_, i) => ({id: 'abs-' + i, title: 'Synthetic ' + i,
     original_title: 'Synthetic ' + i, author: 'Writer', original_author: 'Writer', isbn: '', url: '',
     completed_date: '2026-10-01', reason: 'Review', provenance: 'Synthetic', ready: false}));
-  let job = null, calls = [], clock = 0, hold = false, release, frame, w;
+   let job = null, calls = [], clock = 0, hold = false, release, frame, w, batches = [], savedPayload, returnedPayload;
   const tick = () => new Promise(resolve => setTimeout(resolve, 0));
   async function mount() {
     if (frame) frame.remove();
@@ -26,12 +26,20 @@
     w.setTimeout = (fn, delay) => {const timer = {fn, delay}; w.timers.push(timer); return timer;};
     w.clearTimeout = timer => {w.timers = w.timers.filter(t => t !== timer);};
     w.api = async (path, payload) => {
-      if (path === '/api/goodreads') return {books, batches: [], excluded: 3000, match_job: structuredClone(job)};
+       if (path === '/api/goodreads') return {books, batches, excluded: 3000, match_job: structuredClone(job)};
+       if (path === '/api/goodreads/save') {
+         savedPayload = payload; Object.assign(books.find(b => b.id === payload.book_id), payload, {ready: true}); return {saved: true};
+       }
+       if (path.startsWith('/api/goodreads/batch-items')) return {items: [
+         {id: books[1].id, title: books[1].title, author: books[1].author, isbn: 'B0CHYSM5M4', state: 'exported'},
+         {id: books[2].id, title: books[2].title, author: books[2].author, isbn: '9780306406157', state: 'imported'}]};
+       if (path === '/api/goodreads/return-to-review') {returnedPayload = payload; return {returned: true};}
       if (path === '/api/goodreads/match-batch') {job ||= {id: 'synthetic-job', items: books.filter(b => b.match_eligible !== false || b.retry_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
        if (path === '/api/goodreads/retry-provider') {job = {id: 'synthetic-retry', items: books.filter(b => b.retry_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
        if (path === '/api/goodreads/recheck') {job ||= {id: 'synthetic-recheck', items: books.filter(b => b.recheck_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
-      if (path === '/api/goodreads/resolve') {
-        assert(payload.book_ids.length === 1, 'exactly one ABS ID per request');
+       if (path === '/api/goodreads/resolve') {
+         assert(payload.book_ids.length === 1, 'exactly one ABS ID per request');
+         if (!payload.batch_id) return {results: [{candidate: {title: 'Catalog suggestion', author: 'Writer', isbn: '9780306406157'}, reason: 'Synthetic suggestion'}]};
         const entry = job.items.find(i => i.id === payload.book_ids[0]);
         assert(entry && entry.state === 'queued', 'no saved/failed/repeated IDs');
         calls.push({id: entry.id, clock});
@@ -63,7 +71,7 @@
   await run;
   assert(calls.length === 25 && new Set(calls.map(c => c.id)).size === 25, 'bounded 25, no repeats or seed entries');
   assert(calls.every((c, i) => !i || c.clock - calls[i-1].clock >= 5000), 'provider pacing respected');
-  assert(/25 \/ 25 processed · 7 ready · 6 review · 6 skipped · 6 provider errors/.test(w.$('#gr-match-progress').textContent), 'all outcome counts visible');
+   assert(/25 \/ 25 processed · 7 suggested \(Save required\) · 6 review · 6 skipped · 6 provider errors/.test(w.$('#gr-match-progress').textContent), 'all outcome counts visible');
   assert(!w.$('#gr-books').inert && !w.$('#gr-match-eligible').disabled, 'controls restored');
   books[0].provider_error = true; books[0].retry_eligible = true;
   books[0].reason = 'Google Books [daily_quota]: Daily quota exceeded (HTTP 429).';
@@ -103,8 +111,26 @@
     await mount();
     const recoveredCard = w.$('#gr-books').children[1];
     assert(recoveredCard.textContent.includes('Synthetic Voice - narrator'), 'original ABS author remains visibly available');
-    assert(recoveredCard.querySelector('input[name=author]').value === 'Catalog Writer, Catalog Coauthor', 'saved form uses full catalog authors');
-    document.querySelector('#result').textContent = 'PASS: progress, 5-second rate, 25 cap, pause (waiting/in-flight), page-close resume, partial decisions and counts, honest blocked cards, explicit provider retry, legacy-blocked queues, and paced bounded re-check with provider exclusion.';
+     assert(recoveredCard.querySelector('input[name=author]').value === 'Catalog Writer, Catalog Coauthor', 'saved form uses full catalog authors');
+     const manualForm = recoveredCard.querySelector('form'), detail = manualForm.querySelector('details');
+     assert(!detail.open && manualForm.querySelector('input[name=isbn]').closest('details') === null, 'identifier visible outside closed details');
+     assert(manualForm.querySelector('select[name=public_rating]').closest('details') === null, 'public stars visible without expanding');
+     assert(recoveredCard.querySelector('img').getAttribute('src') === '/api/cover?id=abs-1', 'cover uses authenticated local ABS proxy');
+     const google = [...manualForm.querySelectorAll('a')].find(a => a.textContent === 'Find Goodreads match');
+     assert(google && google.closest('details') === null && google.href.startsWith('https://www.google.com/search?q='), 'Google button visible and encoded');
+     manualForm.elements.isbn.value = 'B0CHYSM5M4'; manualForm.elements.isbn.dispatchEvent(new w.Event('input', {bubbles: true}));
+     [...manualForm.querySelectorAll('button')].find(b => b.textContent === 'Find work ISBN (free catalogs)').click(); await tick();
+     assert(manualForm.elements.isbn.value === 'B0CHYSM5M4', 'manual ASIN survives catalog suggestion');
+     manualForm.elements.public_rating.value = '5'; manualForm.requestSubmit(); await tick();
+     assert(savedPayload.book_id === 'abs-1' && savedPayload.isbn === 'B0CHYSM5M4' && savedPayload.public_rating === 5 && savedPayload.confirmed, 'Save confirms export details with public-only stars');
+     assert(w.$('#gr-selected').textContent === '1 selected' && !w.$('#gr-export').disabled, 'saved title selected for export');
+     batches = [{id: 'old-batch', created_at: '2026-10-01', count: 2, failed: 0, imported: 1}]; await w.loadGoodreads(false);
+     const history = w.$('#gr-batches').querySelector('details'); history.open = true; await tick(); await tick();
+     const returns = [...history.querySelectorAll('button')].filter(b => b.textContent === 'Return to review');
+     assert(returns.length === 1 && history.textContent.includes('confirmed imported') && history.textContent.includes('exported-unconfirmed'), 'history lists individual states; only unconfirmed title offers return');
+     returns[0].click(); await tick();
+     assert(returnedPayload.batch_id === 'old-batch' && returnedPayload.book_id === 'abs-1', 'return targets a single old-batch title, not entire batch');
+     document.querySelector('#result').textContent = 'PASS: bounded/paced matching, pause/resume, retries, visible covers/Google/identifier/public-stars/Save, collapsed details, manual identifier wins, save-selection, and individual history return states.';
   document.title = 'PASS matching browser tests';
 })().catch(error => {document.querySelector('#result').textContent = error.stack; document.title = 'FAIL matching browser tests';});
 </script>

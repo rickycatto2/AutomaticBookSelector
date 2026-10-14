@@ -57,9 +57,8 @@ class CompanionTests(unittest.TestCase):
         self.assertNotIn('Private note', batch['csv'])
         self.assertNotIn('My Review', batch['csv'])
         self.assertEqual(self.store.feedback_book('one')['feedback'], private)
-        self.assertEqual(self.gr.review()['books'], [])
-        with self.assertRaises(AppError):
-            self.gr.export(['one'])
+        self.assertEqual(self.gr.review()['books'][0]['import_state'], 'exported-unconfirmed')
+        self.assertEqual(self.gr.export(['one'])['count'], 1)  # safe re-import; no implicit acceptance
         self.assertEqual(self.gr.batch(batch['id'])['csv'], batch['csv'])
 
     def test_abs_dates_are_real_local_dates_and_missing_dates_block_export(self):
@@ -70,19 +69,20 @@ class CompanionTests(unittest.TestCase):
         with self.assertRaises(AppError):
             self.match(completed_date='')
         self.match(completed_date='', ignored=True)
-        self.assertEqual(self.gr.review()['books'], [])
+        self.assertTrue(self.gr.review()['books'][0]['skipped'])
+        self.assertFalse(self.gr.review()['books'][0]['ready'])
 
     def test_history_read_titles_and_editions_are_excluded_but_to_read_is_not(self):
         self.abs.items.append(item('edition', 'One (Audio Edition)', 'Writer'))
         self.finish()
         self.finish('edition')
-        self.assertEqual(len(self.gr.review()['books']), 1)
+        self.assertEqual(len(self.gr.review()['books']), 2)  # err toward more completed editions
         with self.store.db() as db:
             db.execute("INSERT INTO history VALUES ('123','One','Writer','',0,'read','','','',1,'one','writer')")
         self.assertEqual(self.gr.review()['books'], [])
         with self.store.db() as db:
             db.execute("UPDATE history SET shelf='to-read',read_count=0")
-        self.assertEqual(len(self.gr.review()['books']), 1)
+        self.assertEqual(len(self.gr.review()['books']), 2)
 
     def test_failed_rows_return_for_review_and_generic_errors_are_not_guessed(self):
         self.finish()
@@ -90,7 +90,7 @@ class CompanionTests(unittest.TestCase):
         batch = self.gr.export(['one'])
         result = self.gr.reconcile({'batch_id': batch['id'], 'text': 'Upload failed'})
         self.assertTrue(result['unrecognized'])
-        self.assertEqual(self.gr.review()['books'], [])
+        self.assertEqual(self.gr.review()['books'][0]['import_state'], 'exported-unconfirmed')
         result = self.gr.reconcile({'batch_id': batch['id'], 'text': 'Could not import: One by Writer'})
         self.assertEqual(result['flagged'], ['One'])
         self.assertFalse(self.gr.review()['books'][0]['confirmed'])
