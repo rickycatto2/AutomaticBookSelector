@@ -117,7 +117,28 @@
      assert(manualForm.querySelector('select[name=public_rating]').closest('details') === null, 'public stars visible without expanding');
      assert(recoveredCard.querySelector('img').getAttribute('src') === '/api/cover?id=abs-1', 'cover uses authenticated local ABS proxy');
      const google = [...manualForm.querySelectorAll('a')].find(a => a.textContent === 'Find Goodreads match');
-     assert(google && google.closest('details') === null && google.href.startsWith('https://www.google.com/search?q='), 'Google button visible and encoded');
+      assert(google && google.closest('details') === null && google.href.startsWith('https://www.google.com/search?q='), 'Google button visible and encoded');
+      const printGoogle = [...manualForm.querySelectorAll('a')].find(a => a.textContent === 'Find print/ebook edition');
+      for (const link of [google, printGoogle]) {
+        const url = new URL(link.href);
+        assert(url.searchParams.get('q').includes('Catalog Writer audiobook') && !url.searchParams.get('q').includes('Catalog Coauthor'), 'both searches use audiobook and only first author');
+      }
+      manualForm.elements.title.value = '<svg onload="alert(1)"> &x=1# +';
+      manualForm.elements.author.value = "O'Writer; Narrator";
+      for (const link of [google, printGoogle]) {
+        link.dispatchEvent(new w.Event('click')); // refresh href without opening a real search tab
+        const url = new URL(link.href);
+        assert(url.origin === 'https://www.google.com' && url.hash === '' && [...url.searchParams].length === 1, 'hostile fields cannot inject URL parameters');
+        assert(!/[&+= #"'<>!()*]/.test(link.href.split('?q=')[1]), 'query fully percent encoded');
+        assert(!url.searchParams.get('q').includes('Narrator'), 'semicolon truncates authors');
+      }
+      manualForm.elements.title.value = books[1].title; manualForm.elements.author.value = books[1].author;
+      const skip = [...manualForm.querySelectorAll('button')].find(b => b.textContent === 'Skip this book');
+      assert(skip && !skip.closest('details'), 'Skip this book visible without expanding details');
+      assert(recoveredCard.textContent.includes('excluded from exports and Goodreads suggestions until you Save again'), 'skip consequences and resume visible');
+      const help = w.$('#gr-queue-help');
+      assert(help.textContent.includes('How to clear your queue') && help.textContent.includes('Confirm imported') && help.textContent.includes('Skip this book') && help.textContent.includes('ambiguity'), 'queue help explains skip versus checked import confirmation');
+      assert(![...w.$('#goodreads').querySelectorAll('button')].some(b => /clear (all|everything|queue)/i.test(b.textContent)), 'no bulk clear action');
      manualForm.elements.isbn.value = 'B0CHYSM5M4'; manualForm.elements.isbn.dispatchEvent(new w.Event('input', {bubbles: true}));
      [...manualForm.querySelectorAll('button')].find(b => b.textContent === 'Find work ISBN (free catalogs)').click(); await tick();
      assert(manualForm.elements.isbn.value === 'B0CHYSM5M4', 'manual ASIN survives catalog suggestion');
@@ -127,7 +148,8 @@
      batches = [{id: 'old-batch', created_at: '2026-10-01', count: 2, failed: 0, imported: 1}]; await w.loadGoodreads(false);
      const history = w.$('#gr-batches').querySelector('details'); history.open = true; await tick(); await tick();
      const returns = [...history.querySelectorAll('button')].filter(b => b.textContent === 'Return to review');
-     assert(returns.length === 1 && history.textContent.includes('confirmed imported') && history.textContent.includes('exported-unconfirmed'), 'history lists individual states; only unconfirmed title offers return');
+      assert(returns.length === 1 && history.textContent.includes('confirmed imported') && history.textContent.includes('exported-unconfirmed'), 'history lists individual states; only unconfirmed title offers return');
+      assert(history.textContent.includes('Brings this one book back into the working queue.') && [...history.querySelectorAll('button')].some(b => b.textContent === 'Confirm imported'), 'individual history actions self explanatory');
      returns[0].click(); await tick();
      assert(returnedPayload.batch_id === 'old-batch' && returnedPayload.book_id === 'abs-1', 'return targets a single old-batch title, not entire batch');
      document.querySelector('#result').textContent = 'PASS: bounded/paced matching, pause/resume, retries, visible covers/Google/identifier/public-stars/Save, collapsed details, manual identifier wins, save-selection, and individual history return states.';

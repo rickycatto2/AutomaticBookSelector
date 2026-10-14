@@ -77,16 +77,43 @@ async function main() {
    assert.ok(card.all().some(n => n.textContent.includes('catalog ISBN 9780306406157')));
    form.elements.isbn.value = '';
   form.elements.title.value = '=cmd|calc "Cleat Cute" +2';
-  form.elements.author.value = 'Amy + "Bob" & Co @x';
+   form.elements.author.value = 'Amy + "Bob" & Co @x, Narrator; Other';
   for (const fn of search.listeners.click) fn();
   for (const fn of printSearch.listeners.click) fn();
   for (const link of [search, printSearch]) {
     assert.ok(!/[&+= #"'<>]/.test(queryPart(link)), 'raw query must contain no unencoded URL or formula characters: ' + link.href);
   }
   assert.equal(decodeURIComponent(queryPart(search)),
-    'site:goodreads.com/book/show =cmd|calc "Cleat Cute" +2 Amy + "Bob" & Co @x');
+     'site:goodreads.com/book/show =cmd|calc "Cleat Cute" +2 Amy + "Bob" & Co @x audiobook');
   assert.equal(decodeURIComponent(queryPart(printSearch)),
-    'site:goodreads.com/book/show =cmd|calc "Cleat Cute" +2 Amy + "Bob" & Co @x paperback OR hardcover OR print');
+     'site:goodreads.com/book/show =cmd|calc "Cleat Cute" +2 Amy + "Bob" & Co @x audiobook paperback OR hardcover OR print');
+   for (const author of ['Gracie Page, Venice Van Someren', 'Gracie Page; Venice Van Someren']) {
+     form.elements.author.value = author;
+     for (const link of [search, printSearch]) {
+       for (const fn of link.listeners.click) fn();
+       assert.match(decodeURIComponent(queryPart(link)), /Gracie Page audiobook/);
+       assert.doesNotMatch(decodeURIComponent(queryPart(link)), /Venice/);
+       assert.equal(form.elements.author.value, author, 'search never rewrites export authors');
+     }
+   }
+   for (const [title, author] of [['', ''], [null, undefined], ['\uD800<svg onload="x"> &x=1#', "O'Writer (!)*; Narrator"]]) {
+     form.elements.title.value = title; form.elements.author.value = author;
+     for (const link of [search, printSearch]) {
+       for (const fn of link.listeners.click) fn();
+       const url = new URL(link.href);
+       assert.equal(url.origin, 'https://www.google.com');
+       assert.equal(url.hash, '');
+       assert.deepEqual([...url.searchParams.keys()], ['q']);
+       assert.ok(!/[&+= #"'<>!()*]/.test(queryPart(link)));
+       assert.match(url.searchParams.get('q'), /audiobook/);
+     }
+   }
+   assert.ok(card.all().some(n => n.textContent === 'Skip this book'));
+   assert.ok(card.all().some(n => /excluded from exports and Goodreads suggestions until you Save again/.test(n.textContent)));
+   const html = fs.readFileSync('static/index.html', 'utf8');
+   const help = html.match(/<aside id="gr-queue-help"[\s\S]*?<\/aside>/)[0];
+   for (const text of ['How to clear your queue', 'rejection output', 'I checked that the other books in this batch imported successfully', 'still-exported', 'ambiguity', 'Confirm imported', 'Skip this book', 'Save again']) assert.ok(help.includes(text));
+   assert.doesNotMatch(html + source, /clear[-_ ](?:everything|all|queue)|bulk[-_ ]clear/i);
   // ISBN direct link only appears for a checksum-valid ISBN, never asserting recognition.
   const isbnLink = card.all().find(n => n.textContent === 'Open Goodreads edition for this ISBN');
   assert.equal(isbnLink.hidden, true, 'no ISBN link without an ISBN');
@@ -101,11 +128,12 @@ async function main() {
   isbnInput.value = '034541005X'; formInput(); // ISBN-10 with X check digit
   assert.equal(isbnLink.hidden, false);
   assert.equal(isbnLink.href, 'https://www.goodreads.com/book/isbn/034541005X');
-  automatic = false; book.provider_error = true; book.retry_eligible = true;
+   automatic = false; book.provider_error = true; book.retry_eligible = true; book.skipped = true;
   book.reason = 'Google Books [daily_quota]: Daily quota exceeded (HTTP 429).';
   await context.loadGoodreads(false);
   card = $('#gr-books').children[0];
-  const status = card.all().find(n => n.tag === 'p' && n.textContent.includes('daily_quota'));
+   assert.match(card.all().find(n => n.className === 'gr-state').textContent, /Skipped: excluded from exports and Goodreads suggestions\. Save again to resume/);
+   const status = card.all().find(n => n.tag === 'p' && n.textContent.includes('daily_quota'));
   assert.match(status.textContent, /Lookup could not run; export stays blocked/);
   assert.doesNotMatch(status.textContent, /Review required/);
    assert.ok(card.all().find(n => n.textContent === 'Retry provider-blocked books (up to 25)'));
