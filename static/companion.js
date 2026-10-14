@@ -75,7 +75,7 @@ function canonicalIsbn(value) {
 }
 async function loadGoodreads(automatic = false) {
   const ticket = ++grTicket, result = await api('/api/goodreads'); if (ticket !== grTicket) return;
-  grBooks = result.books; grSelected = new Set([...grSelected].filter(id => grBooks.some(b => b.id === id && b.ready)));
+  grBooks = result.books; resetImportPreview(); grSelected = new Set([...grSelected].filter(id => grBooks.some(b => b.id === id && b.ready)));
   grMatchJob = result.match_job || null; grDirty = false; grMatchProgress();
   $('#gr-books').replaceChildren(); $('#gr-summary').textContent = `${result.books.length} completed books not confirmed imported · ${result.books.filter(b => b.ready).length} saved and ready. ${result.excluded} confirmed/read-history entries excluded. Exporting does not clear the queue: confirm imported books in Export history. Skip books you do not want on Goodreads instead of exporting and re-uploading them.`;
   if (!result.books.length) $('#gr-books').append(el('div', 'empty', 'All caught up. New completions will appear here.'));
@@ -217,8 +217,32 @@ async function chooseFailedBooks() {
   const result = await api('/api/goodreads/batch-items?id=' + encodeURIComponent($('#gr-batch').value)); $('#gr-failures').replaceChildren();
   renderImportItems(result.items); resetImportPreview();
 }
-let grReportKey = '', grManualFailures = false;
-function resetImportPreview() {grReportKey = ''; $('#gr-reconcile-form [type=submit]').textContent = 'Preview import result';}
+let grReportKey = '', grManualFailures = false, grClearItems = null, grPendingPlan = null;
+function resetImportPreview() {grReportKey = ''; grClearItems = null; grPendingPlan = null; $('#gr-reconcile-form [type=submit]').textContent = 'Finish this batch: clear imports, keep failures'; $('#gr-import-summary').textContent = ''; $('#gr-clear-imports').hidden = false;}
+function importPlan(items, confirm) {
+  const skipped = items.filter(b => grBooks.some(saved => saved.id === b.id && saved.skipped));
+  const failed = items.filter(b => b.proposed_failed && !skipped.includes(b));
+  const imported = confirm ? items.filter(b => b.state === 'exported' && !b.proposed_failed && !skipped.includes(b)) : [];
+  return {skipped, failed, imported};
+}
+function showImportPlan(plan) {
+  grPendingPlan = plan;
+  $('#gr-clear-imports').hidden = true;
+  $('#gr-import-summary').textContent = `${plan.imported.length} books will be marked imported and leave your queue; ${plan.failed.length} failed books will go back to review for correction; ${plan.skipped.length} skipped books stay excluded from exports and suggestions. Nothing has changed yet. Confirm below to apply this plan.`;
+  $('#gr-reconcile-form [type=submit]').textContent = 'Confirm: apply this plan and clear imported books';
+}
+$('#gr-clear-imports').addEventListener('click', () => action($('#gr-clear-imports'), async () => {
+  // Deliberate no-failures path uses the existing per-title confirmation gate,
+  // never invented report evidence or a bypass of reconcile's prose gates.
+  const form = $('#gr-reconcile-form');
+  const report = await api('/api/goodreads/reconcile', {batch_id: $('#gr-batch').value, text: form.elements.output.value, preview: true});
+  renderImportItems(report.items);
+  if (report.items.some(b => b.proposed_failed) || grManualFailures) {resetImportPreview(); message('Failures are selected or detected. Use Finish this batch and resolve the failed books instead.'); return;}
+  if (form.elements.output.value.trim() && (report.ambiguous || report.unrecognized)) {resetImportPreview(); message('Unrecognized or ambiguous output cannot clear the remainder. Choose failed books manually, or remove the output only after verifying every remaining title in Goodreads.'); return;}
+  grClearItems = importPlan(report.items, true).imported;
+  grReportKey = '';
+  showImportPlan(importPlan(report.items, true));
+}));
 function renderImportItems(items) {
   $('#gr-failures').replaceChildren();
   for (const book of items) {
@@ -232,18 +256,29 @@ $('#gr-batch').addEventListener('change', () => {$('#gr-failures').replaceChildr
 $('#gr-reconcile-form').elements.output.addEventListener('input', () => {$('#gr-failures').replaceChildren(); grManualFailures = false; resetImportPreview();});
 $('#gr-reconcile-form').elements.confirm_remaining.addEventListener('change', resetImportPreview);
 $('#gr-reconcile-form').addEventListener('submit', e => {e.preventDefault(); const form = e.currentTarget; action(form.querySelector('[type=submit]'), async () => {
+  if (grClearItems !== null) {
+    const items = grClearItems; grClearItems = null;
+    for (const book of items) await api('/api/goodreads/confirm-imported', {batch_id: $('#gr-batch').value, book_id: book.id});
+    await loadGoodreads(); resetImportPreview(); grManualFailures = false; form.elements.output.value = ''; form.elements.confirm_remaining.checked = false;
+    message(`${items.length} books confirmed imported and cleared from your queue. Skipped books remain excluded.`); return;
+  }
   const payload = {batch_id: $('#gr-batch').value, text: form.elements.output.value, confirm_remaining: form.elements.confirm_remaining.checked};
   if (grManualFailures) payload.failed_ids = [...$('#gr-failures').querySelectorAll('input:checked')].map(i => i.value);
   const key = JSON.stringify(payload), preview = key !== grReportKey;
-  const result = await api('/api/goodreads/reconcile', {...payload, preview});
+  const planToApply = grPendingPlan;
+  const skipPresent = preview ? grBooks.some(b => b.skipped) : Boolean(planToApply?.skipped.length);
+  const result = await api('/api/goodreads/reconcile', {...payload, confirm_remaining: payload.confirm_remaining && !skipPresent, preview});
   renderImportItems(result.items);
   if (preview) {
-    if (result.ambiguous || result.unrecognized || result.no_op) {resetImportPreview(); message('Nothing saved. Output is empty or ambiguous; explicitly select the failed books. Unrecognized output cannot confirm remaining imports.');}
-    else {grReportKey = key; form.querySelector('[type=submit]').textContent = 'Save reviewed import result'; message(`${result.mixed ? 'Mixed success/failure report. ' : ''}Preview only: ${result.flagged.length} proposed failures. Check the per-book states and selections, then save.${form.elements.confirm_remaining.checked && !result.can_confirm_remaining ? ' Remaining imports will not be marked.' : ''}`);}
+    $('#gr-clear-imports').hidden = result.items.some(b => b.proposed_failed);
+    if (result.ambiguous || result.unrecognized || result.no_op) {resetImportPreview(); message('Nothing changed. For no failures, verify the titles in Goodreads and use “I already imported these”. For ambiguity, choose failed books manually. Unknown text alone cannot clear imports.');}
+    else {grReportKey = key; showImportPlan(importPlan(result.items, payload.confirm_remaining && result.can_confirm_remaining));}
     return;
   }
+  const plan = importPlan(result.items, payload.confirm_remaining && result.can_confirm_remaining);
+  if (skipPresent) for (const book of plan.imported) await api('/api/goodreads/confirm-imported', {batch_id: payload.batch_id, book_id: book.id});
   await loadGoodreads(); resetImportPreview(); grManualFailures = false; form.elements.output.value = ''; form.elements.confirm_remaining.checked = false;
-  message(result.flagged.length ? `${result.flagged.length} failed books returned to the review list.` : 'Reviewed import result saved.');
+  message(`Batch finished: ${result.can_confirm_remaining ? planToApply.imported.length : 0} books confirmed imported and cleared from your queue; ${planToApply.failed.length} failed books returned to review; ${planToApply.skipped.length} skipped books remain excluded.`);
 });});
 function displayNumber(value, suffix = '') { return value === null || value === undefined ? 'Not available' : value.toFixed(1) + suffix; }
 async function loadStats() {

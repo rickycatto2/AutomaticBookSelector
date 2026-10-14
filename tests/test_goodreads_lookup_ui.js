@@ -112,7 +112,7 @@ async function main() {
    assert.ok(card.all().some(n => /excluded from exports and Goodreads suggestions until you Save again/.test(n.textContent)));
    const html = fs.readFileSync('static/index.html', 'utf8');
    const help = html.match(/<aside id="gr-queue-help"[\s\S]*?<\/aside>/)[0];
-   for (const text of ['How to clear your queue', 'rejection output', 'I checked that the other books in this batch imported successfully', 'still-exported', 'ambiguity', 'Confirm imported', 'Skip this book', 'Save again']) assert.ok(help.includes(text));
+   for (const text of ['How to clear your queue', 'rejection output', 'I checked that the other books in this batch imported successfully', 'still-exported', 'ambiguity', 'Confirm imported', 'Skip this book', 'Save again', 'free catalogs', 'ABS-supplied ASIN', 'not Goodreads', 'read the exact counts', 'confirm the plan']) assert.ok(help.includes(text), text);
    assert.doesNotMatch(html + source, /clear[-_ ](?:everything|all|queue)|bulk[-_ ]clear/i);
   // ISBN direct link only appears for a checksum-valid ISBN, never asserting recognition.
   const isbnLink = card.all().find(n => n.textContent === 'Open Goodreads edition for this ISBN');

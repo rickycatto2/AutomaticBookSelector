@@ -11,7 +11,7 @@
   const books = Array.from({length: 30}, (_, i) => ({id: 'abs-' + i, title: 'Synthetic ' + i,
     original_title: 'Synthetic ' + i, author: 'Writer', original_author: 'Writer', isbn: '', url: '',
     completed_date: '2026-10-01', reason: 'Review', provenance: 'Synthetic', ready: false}));
-   let job = null, calls = [], clock = 0, hold = false, release, frame, w, batches = [], savedPayload, returnedPayload;
+   let job = null, calls = [], clock = 0, hold = false, release, frame, w, batches = [], savedPayload, returnedPayload, importWrites = [], reconcileCalls = [];
   const tick = () => new Promise(resolve => setTimeout(resolve, 0));
   async function mount() {
     if (frame) frame.remove();
@@ -33,7 +33,14 @@
        if (path.startsWith('/api/goodreads/batch-items')) return {items: [
          {id: books[1].id, title: books[1].title, author: books[1].author, isbn: 'B0CHYSM5M4', state: 'exported'},
          {id: books[2].id, title: books[2].title, author: books[2].author, isbn: '9780306406157', state: 'imported'}]};
-       if (path === '/api/goodreads/return-to-review') {returnedPayload = payload; return {returned: true};}
+        if (path === '/api/goodreads/return-to-review') {returnedPayload = payload; return {returned: true};}
+        if (path === '/api/goodreads/confirm-imported') {importWrites.push(payload); return {confirmed_imported: true};}
+        if (path === '/api/goodreads/reconcile') {
+          reconcileCalls.push(payload);
+          const failed = payload.text.startsWith('Failed:');
+          const items = [1, 2, 3].map(i => ({id: books[i].id, title: books[i].title, author: 'Writer', state: 'exported', proposed_failed: failed && i === 1}));
+          return {items, flagged: failed ? [books[1].title] : [], ambiguous: payload.text === 'unknown', unrecognized: payload.text === 'unknown', no_op: !payload.text, can_confirm_remaining: !!payload.text && payload.text !== 'unknown'};
+        }
       if (path === '/api/goodreads/match-batch') {job ||= {id: 'synthetic-job', items: books.filter(b => b.match_eligible !== false || b.retry_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
        if (path === '/api/goodreads/retry-provider') {job = {id: 'synthetic-retry', items: books.filter(b => b.retry_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
        if (path === '/api/goodreads/recheck') {job ||= {id: 'synthetic-recheck', items: books.filter(b => b.recheck_eligible).slice(0, 25).map(b => ({id: b.id, state: 'queued'}))}; return {job: structuredClone(job)};}
@@ -138,7 +145,7 @@
       assert(recoveredCard.textContent.includes('excluded from exports and Goodreads suggestions until you Save again'), 'skip consequences and resume visible');
       const help = w.$('#gr-queue-help');
       assert(help.textContent.includes('How to clear your queue') && help.textContent.includes('Confirm imported') && help.textContent.includes('Skip this book') && help.textContent.includes('ambiguity'), 'queue help explains skip versus checked import confirmation');
-      assert(![...w.$('#goodreads').querySelectorAll('button')].some(b => /clear (all|everything|queue)/i.test(b.textContent)), 'no bulk clear action');
+       assert(importWrites.length === 0 && reconcileCalls.length === 0, 'page load never confirms imports');
      manualForm.elements.isbn.value = 'B0CHYSM5M4'; manualForm.elements.isbn.dispatchEvent(new w.Event('input', {bubbles: true}));
      [...manualForm.querySelectorAll('button')].find(b => b.textContent === 'Find work ISBN (free catalogs)').click(); await tick();
      assert(manualForm.elements.isbn.value === 'B0CHYSM5M4', 'manual ASIN survives catalog suggestion');
@@ -151,8 +158,31 @@
       assert(returns.length === 1 && history.textContent.includes('confirmed imported') && history.textContent.includes('exported-unconfirmed'), 'history lists individual states; only unconfirmed title offers return');
       assert(history.textContent.includes('Brings this one book back into the working queue.') && [...history.querySelectorAll('button')].some(b => b.textContent === 'Confirm imported'), 'individual history actions self explanatory');
      returns[0].click(); await tick();
-     assert(returnedPayload.batch_id === 'old-batch' && returnedPayload.book_id === 'abs-1', 'return targets a single old-batch title, not entire batch');
-     document.querySelector('#result').textContent = 'PASS: bounded/paced matching, pause/resume, retries, visible covers/Google/identifier/public-stars/Save, collapsed details, manual identifier wins, save-selection, and individual history return states.';
+      assert(returnedPayload.batch_id === 'old-batch' && returnedPayload.book_id === 'abs-1', 'return targets a single old-batch title, not entire batch');
+      const finish = w.$('#gr-reconcile-form'), clear = w.$('#gr-clear-imports');
+      books[3].skipped = true; await w.loadGoodreads(false);
+      assert(clear.textContent.includes('I already imported these') && importWrites.length === 0, 'explicit clear control, no auto-clear');
+      clear.click(); await tick();
+      assert(importWrites.length === 0 && reconcileCalls.at(-1).preview, 'no-failure first step never mutates');
+      assert(w.$('#gr-import-summary').textContent.includes('2 books will be marked imported') && w.$('#gr-import-summary').textContent.includes('1 skipped books'), 'empty report counts exclude skipped');
+      finish.requestSubmit(); await tick();
+      assert(importWrites.length === 2 && importWrites.every(p => p.book_id !== books[3].id), 'confirm step clears only verified non-skipped titles');
+      finish.elements.output.value = 'Failed: 9780306406157'; finish.elements.output.dispatchEvent(new w.Event('input'));
+      finish.elements.confirm_remaining.checked = true;
+      finish.requestSubmit(); await tick();
+      assert(w.$('#gr-import-summary').textContent.includes('1 books will be marked imported') && w.$('#gr-import-summary').textContent.includes('1 failed books will go back to review'), 'mixed exact keep/fail counts');
+      assert(importWrites.length === 2 && reconcileCalls.at(-1).preview, 'mixed first step never mutates');
+      finish.requestSubmit(); await tick();
+      assert(!reconcileCalls.at(-1).preview && importWrites.length === 3, 'mixed confirm applies failures and verified remainder');
+      finish.elements.output.value = 'unknown'; finish.elements.output.dispatchEvent(new w.Event('input'));
+      clear.click(); await tick();
+      assert(importWrites.length === 3 && !w.$('#gr-import-summary').textContent, 'unknown report cannot clear remainder');
+      finish.elements.output.value = 'Imported: 9780306406157'; finish.elements.output.dispatchEvent(new w.Event('input'));
+      clear.click(); await tick();
+      assert(importWrites.length === 3 && w.$('#gr-import-summary').textContent.includes('0 failed books'), 'success-only clear still requires confirmation');
+      finish.elements.output.value = ''; finish.elements.output.dispatchEvent(new w.Event('input'));
+      assert(!w.$('#gr-import-summary').textContent, 'editing invalidates pending confirmation');
+      document.querySelector('#result').textContent = 'PASS: bounded/paced matching, pause/resume, retries, visible covers/Google/identifier/public-stars/Save, collapsed details, manual identifier wins, save-selection, individual history return states, and explicit two-step batch clearing with exact import/failure/skip counts, empty/success-only reports and unknown-output blocking.';
   document.title = 'PASS matching browser tests';
 })().catch(error => {document.querySelector('#result').textContent = error.stack; document.title = 'FAIL matching browser tests';});
 </script>
