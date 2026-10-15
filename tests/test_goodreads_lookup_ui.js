@@ -26,7 +26,8 @@ async function main() {
     api: async (path, payload) => {
       calls.push([path, payload]);
       if (path === '/api/goodreads') return {books: [{...book, ready: automatic && !book.skipped}], excluded: 0, batches: []};
-      if (path === '/api/goodreads/skip') {book.skipped = payload.ignored; return {skipped: book.skipped};}
+       if (path === '/api/goodreads/skip') {book.skipped = payload.ignored; return {skipped: book.skipped};}
+       if (path === '/api/goodreads/save') return {saved: true};
       if (path === '/api/goodreads/auto-resolve') {if (hold) await hold; automatic = true; return {results: [{automatic: true}]};}
        if (path === '/api/goodreads/resolve') {
          if (suggestion) return {results: [{automatic: false, candidate: {title: 'Catalog title', author: 'Catalog author', isbn: '9780306406157'}, reason: 'Synthetic suggestion', provenance: 'Catalog'}]};
@@ -85,9 +86,43 @@ async function main() {
     assert.ok(!/[&+= #"'<>]/.test(queryPart(link)), 'raw query must contain no unencoded URL or formula characters: ' + link.href);
   }
   assert.equal(decodeURIComponent(queryPart(search)),
-     'site:goodreads.com/book/show =cmd|calc "Cleat Cute" +2 Amy + "Bob" & Co @x audiobook');
+      'goodreads =cmd|calc "Cleat Cute" +2 Amy + "Bob" & Co @x audiobook');
   assert.equal(decodeURIComponent(queryPart(printSearch)),
-     'site:goodreads.com/book/show =cmd|calc "Cleat Cute" +2 Amy + "Bob" & Co @x audiobook paperback OR hardcover OR print');
+      'goodreads =cmd|calc "Cleat Cute" +2 Amy + "Bob" & Co @x audiobook paperback OR hardcover OR print');
+   const noiseMarkers = ['unabridged', 'abridged', 'audiobook', 'audiobook edition', 'audio book', 'audio edition', 'large print', 'ebook', 'e-book', 'kindle', 'kindle edition', 'digital edition', 'cd', 'mp3', 'audio cd', 'unabridged audio'];
+   const titleCases = [
+     ...noiseMarkers.flatMap(marker => [[`The (${marker}) Title`, 'The Title'], [`The [${marker.toUpperCase()}] Title`, 'The Title']]),
+     ['[Audio CD] The (UnAbRiDgEd) Title [Kindle Edition]', 'The Title'],
+     ['The Title (Book 2) [Volume 3] (A Novel): Subtitle', 'The Title (Book 2) [Volume 3] (A Novel): Subtitle'],
+     ['The Title (Illustrated) [Not abridged] (Unabridged version)', 'The Title (Illustrated) [Not abridged] (Unabridged version)'],
+     ['(Unabridged) [Ebook]', '(Unabridged) [Ebook]'],
+   ];
+   form.elements.author.value = 'Malcolm Gladwell, Narrator';
+   for (const [title, cleaned] of titleCases) {
+     form.elements.title.value = title;
+     for (const [link, tail] of [[search, 'audiobook'], [printSearch, 'audiobook paperback OR hardcover OR print']]) {
+       for (const fn of link.listeners.click) fn();
+       assert.equal(decodeURIComponent(queryPart(link)), `goodreads ${cleaned} Malcolm Gladwell ${tail}`);
+       assert.equal(form.elements.title.value, title, 'search clicks never rewrite the form title');
+     }
+   }
+   // Build and click both links, then submit through the real Save handler.
+   const absTitle = 'The American Way of Killing (Unabridged)';
+   book.title = absTitle;
+   await context.loadGoodreads();
+   const savedCard = $('#gr-books').children[0], savedForm = savedCard.all().find(n => n.className === 'gr-form');
+   for (const label of ['Find Goodreads match', 'Find print/ebook edition']) {
+     const link = savedCard.all().find(n => n.textContent === label);
+     assert.ok(decodeURIComponent(queryPart(link)).includes('goodreads The American Way of Killing Writer audiobook'));
+     for (const fn of link.listeners.click) fn();
+     assert.equal(savedForm.elements.title.value, absTitle, 'building/clicking links preserves exact ABS title');
+   }
+   savedForm.elements.isbn.value = '9780306406157';
+   for (const fn of savedForm.listeners.submit) fn({preventDefault() {}});
+   await new Promise(resolve => setImmediate(resolve));
+   assert.equal(calls.filter(c => c[0] === '/api/goodreads/save').at(-1)[1].title, absTitle, 'saved/export payload keeps (Unabridged)');
+   assert.equal(book.title, absTitle, 'search does not mutate source book');
+   book.title = 'One';
    for (const author of ['Gracie Page, Venice Van Someren', 'Gracie Page; Venice Van Someren']) {
      form.elements.author.value = author;
      for (const link of [search, printSearch]) {

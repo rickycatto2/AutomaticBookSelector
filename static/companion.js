@@ -73,6 +73,12 @@ function canonicalIsbn(value) {
   }
   return '';
 }
+// Search-only cleanup: never write this derived title back to the form or payload.
+function grSearchTitle(value) {
+  const original = String(value ?? '').trim();
+  const noise = /^(?:unabridged|abridged|audiobook|audiobook edition|audio book|audio edition|large print|ebook|e-book|kindle|kindle edition|digital edition|cd|mp3|audio cd|unabridged audio)$/i;
+  return original.replace(/\(([^()]*)\)|\[([^\[\]]*)\]/g, (marker, round, square) => noise.test((round ?? square).trim()) ? ' ' : marker).replace(/\s+/g, ' ').trim() || original;
+}
 async function loadGoodreads(automatic = false) {
   const ticket = ++grTicket, result = await api('/api/goodreads'); if (ticket !== grTicket) return;
   grBooks = result.books; resetImportPreview(); grSelected = new Set([...grSelected].filter(id => grBooks.some(b => b.id === id && b.ready)));
@@ -131,9 +137,9 @@ async function loadGoodreads(automatic = false) {
     for (const [link, extra] of [[search, ' audiobook'], [printSearch, ' audiobook paperback OR hardcover OR print']]) {
       link.target = '_blank'; link.rel = 'noopener noreferrer';
       const sync = () => {
-        const title = String(form.elements.title.value ?? '').trim(), author = String(form.elements.author.value ?? '').split(/[,;]/, 1)[0].trim();
+        const title = grSearchTitle(form.elements.title.value), author = String(form.elements.author.value ?? '').split(/[,;]/, 1)[0].trim();
         // Replace lone surrogate code units before encoding; odd pasted fields must not throw.
-        const query = ['site:goodreads.com/book/show', title, author, extra.trim()].filter(Boolean).join(' ').toWellFormed();
+        const query = ['goodreads', title, author, extra.trim()].filter(Boolean).join(' ').toWellFormed();
         link.href = 'https://www.google.com/search?q=' + encodeURIComponent(query).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
       };
       sync(); link.addEventListener('click', sync);

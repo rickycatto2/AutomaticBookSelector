@@ -120,6 +120,7 @@
     assert(calls.length === beforeRecheck + 25 && !w.$('#gr-books').inert, 're-check one-book pacing and controls restored');
     assert(calls.slice(beforeRecheck).every((c, i, rows) => !i || c.clock - rows[i-1].clock >= 5000), 're-check five-second pacing');
     books[1].original_author = 'Synthetic Voice - narrator'; books[1].author = 'Catalog Writer, Catalog Coauthor';
+    books[1].title = 'The American Way of Killing (Unabridged)';
     await mount();
     const recoveredCard = w.$('#gr-books').children[1];
     assert(recoveredCard.textContent.includes('Synthetic Voice - narrator'), 'original ABS author remains visibly available');
@@ -133,6 +134,7 @@
       const printGoogle = [...manualForm.querySelectorAll('a')].find(a => a.textContent === 'Find print/ebook edition');
       for (const link of [google, printGoogle]) {
         const url = new URL(link.href);
+        assert(url.searchParams.get('q').startsWith('goodreads The American Way of Killing Catalog Writer audiobook'), 'plain Goodreads prefix and search-only noise removal on build');
         assert(url.searchParams.get('q').includes('Catalog Writer audiobook') && !url.searchParams.get('q').includes('Catalog Coauthor'), 'both searches use audiobook and only first author');
       }
       manualForm.elements.title.value = '<svg onload="alert(1)"> &x=1# +';
@@ -144,7 +146,12 @@
         assert(!/[&+= #"'<>!()*]/.test(link.href.split('?q=')[1]), 'query fully percent encoded');
         assert(!url.searchParams.get('q').includes('Narrator'), 'semicolon truncates authors');
       }
-      manualForm.elements.title.value = books[1].title; manualForm.elements.author.value = books[1].author;
+       manualForm.elements.title.value = books[1].title; manualForm.elements.author.value = books[1].author;
+       for (const link of [google, printGoogle]) {
+         link.dispatchEvent(new w.Event('click'));
+         assert(!new URL(link.href).searchParams.get('q').includes('Unabridged'), 'search click removes noise');
+         assert(manualForm.elements.title.value === books[1].title, 'search never changes title field');
+       }
       const skip = [...manualForm.querySelectorAll('button')].find(b => b.textContent === 'Skip this book');
       assert(skip && !skip.closest('details'), 'Skip this book visible without expanding details');
       assert(recoveredCard.textContent.includes('excluded from exports and Goodreads suggestions until you Restore to queue'), 'skip consequences and restore visible');
@@ -155,7 +162,8 @@
      [...manualForm.querySelectorAll('button')].find(b => b.textContent === 'Find work ISBN (free catalogs)').click(); await tick();
      assert(manualForm.elements.isbn.value === 'B0CHYSM5M4', 'manual ASIN survives catalog suggestion');
      manualForm.elements.public_rating.value = '5'; manualForm.requestSubmit(); await tick();
-     assert(savedPayload.book_id === 'abs-1' && savedPayload.isbn === 'B0CHYSM5M4' && savedPayload.public_rating === 5 && savedPayload.confirmed, 'Save confirms export details with public-only stars');
+      assert(savedPayload.book_id === 'abs-1' && savedPayload.isbn === 'B0CHYSM5M4' && savedPayload.public_rating === 5 && savedPayload.confirmed, 'Save confirms export details with public-only stars');
+      assert(savedPayload.title === 'The American Way of Killing (Unabridged)' && books[1].title === savedPayload.title, 'saved/export source title retains exact ABS noise marker after search');
      assert(w.$('#gr-selected').textContent === '1 selected' && !w.$('#gr-export').disabled, 'saved title selected for export');
       batches = [{id: 'old-batch', created_at: '2026-10-01', count: 2, failed: 0, imported: 1}]; await w.loadGoodreads(false);
       const disclosure = w.$('#gr-export-history');

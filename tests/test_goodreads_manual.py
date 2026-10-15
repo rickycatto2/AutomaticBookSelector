@@ -13,13 +13,19 @@ class ManualWorkflowTests(unittest.TestCase):
     save = fixtures.IdentifierTests.save
 
     def test_identifiers_and_formula_guard(self):
+        title = 'The American Way of Killing (Unabridged)'
+        self.abs.items[0]['media']['metadata']['title'] = title
+        self.store.sync()
+        self.assertEqual(self.gr.review()['books'][0]['title'], title)
         for code in ('B0CHYSM5M4', '9780306406157', '0306406152', '978-0-306-40615-7'):
-            self.save(code)
+            self.save(code, title=title)
             batch = self.gr.export(['one'])
             rows = list(csv.reader(io.StringIO(batch['csv'])))
             self.assertEqual(len(rows[0]), 6)
             self.assertEqual(len(rows[1]), 6)
             self.assertEqual(rows[1][2], code.replace('-', ''))
+            self.assertEqual(list(csv.DictReader(io.StringIO(batch['csv'])))[0]['Title'], title)
+            self.assertEqual(self.gr.review()['books'][0]['title'], title)
         for code in ('9780306406158', 'b0CHYSM5M4', 'B0CHYSM5M!', 'B0CHYSM5', '=1+1', 'B0CHYSM5M4\n'):
             with self.subTest(code=code), self.assertRaisesRegex(AppError, 'ISBN-10/13.*ASIN'):
                 self.save(code)
